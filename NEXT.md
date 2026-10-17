@@ -20,8 +20,12 @@ what the boot stops at, clean room (CONTRIBUTING.md), then re-runs `tools/boot.p
    `tools/promote.py` can move `edge-verified` functions to `verified`.
 2. Module loading at run time: when the game asks to load a module listed with action `stub` in
    `game/modules.csv`, report it loaded without mapping it.
-3. `sceKernelGetDirectMemorySize` (libkernel), called by eboot: needs the direct memory size of a
-   PS4 (STATUS.md, "Open questions"). Then the next import `tools/boot.py` names.
+3. Direct memory: `sceKernelAllocateDirectMemory` (which the boot now stops at: eboot asks it for
+   116 MiB at 2 MiB alignment, `eboot+0x2081aa3`) with `sceKernelMapDirectMemory`,
+   `sceKernelReleaseDirectMemory` and the pool they work on. This is the memory manager rather
+   than one value: the region `sceKernelGetDirectMemorySize` reports, the physical addresses the
+   allocator hands out, and the mappings that follow have to agree with each other and with the
+   sizes the guest asks for. Then the next import `tools/boot.py` names.
 
 Roadmap after the boot gets going: kernel, threads and memory; files; input; audio; video
 out; GNM and shaders (the largest). Claimable work per system call group is in the issues
@@ -49,6 +53,9 @@ from the smallest up. New functions go to `main` only verified and readable.
 - Runtime: libkernel `scePthreadAttrGetaffinity`: an attribute reports the six-core application CPU
   set (mask `0x3f`); the boot now reaches the `entry` milestone and stops at
   `sceKernelGetDirectMemorySize` (libkernel, called by eboot).
+- Runtime: libkernel `sceKernelGetDirectMemorySize`: the console's 6 GiB direct memory region as
+  the public toolchain documents it; the boot now stops at the allocation that consumes the
+  value, `sceKernelAllocateDirectMemory` (libkernel, called by eboot).
 - Runtime: the game's own libc and libSceFios2 modules are mapped as guest code (`game/modules.csv`) and the executable's imports they export are bound to them; their functions are tracked in `symbols/module_functions.csv`, replaceable later like game functions.
 - Runtime: our own loader (`runtime/loader.c`) and boot harness (`runtime/boot.c`, `tools/boot.py`); the verification harness maps the executable with the loader.
 
