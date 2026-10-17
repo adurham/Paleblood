@@ -312,7 +312,7 @@ eboot,libScePlayGo,scePlayGoGetLocus,function,
 eboot,libScePlayGo,scePlayGoInitialize,function,
 eboot,libScePlayGo,scePlayGoOpen,function,
 eboot,libScePlayGo,scePlayGoSetInstallSpeed,function,
-eboot,libScePosix,getpagesize,function,
+eboot,libScePosix,getpagesize,function,runtime-unresolved
 eboot,libScePosix,gettimeofday,function,
 eboot,libScePosix,mkdir,function,
 eboot,libScePosix,pthread_attr_destroy,function,
@@ -684,7 +684,7 @@ eboot,libkernel,scePthreadRwlockWrlock,function,
 eboot,libkernel,scePthreadSelf,function,runtime
 eboot,libkernel,scePthreadSetaffinity,function,
 eboot,libkernel,scePthreadSetprio,function,
-eboot,libkernel,scePthreadYield,function,
+eboot,libkernel,scePthreadYield,function,runtime-unresolved
 libSceFios2.elf,?,module_start,function,
 libSceFios2.elf,?,module_stop,function,
 libSceFios2.elf,libSceDiscMap,ioKMruft1ek#A#B,function,
@@ -745,7 +745,7 @@ libSceFios2.elf,libkernel,scePthreadCondSignal,function,
 libSceFios2.elf,libkernel,scePthreadCondTimedwait,function,
 libSceFios2.elf,libkernel,scePthreadCondWait,function,
 libSceFios2.elf,libkernel,scePthreadCreate,function,
-libSceFios2.elf,libkernel,scePthreadEqual,function,
+libSceFios2.elf,libkernel,scePthreadEqual,function,runtime
 libSceFios2.elf,libkernel,scePthreadGetaffinity,function,
 libSceFios2.elf,libkernel,scePthreadGetprio,function,
 libSceFios2.elf,libkernel,scePthreadJoin,function,
@@ -792,7 +792,7 @@ libc.elf,libkernel,_sigprocmask,function,
 libc.elf,libkernel,_write,function,
 libc.elf,libkernel,clock_gettime,function,
 libc.elf,libkernel,fstat,function,
-libc.elf,libkernel,getpagesize,function,
+libc.elf,libkernel,getpagesize,function,runtime-unresolved
 libc.elf,libkernel,getpid,function,
 libc.elf,libkernel,getrusage,function,
 libc.elf,libkernel,gettimeofday,function,
@@ -813,7 +813,7 @@ libc.elf,libkernel,sceKernelMunmap,function,
 libc.elf,libkernel,sceKernelPrintBacktraceWithModuleInfo,function,
 libc.elf,libkernel,scePthreadAttrDestroy,function,runtime
 libc.elf,libkernel,scePthreadAttrGet,function,runtime
-libc.elf,libkernel,scePthreadAttrGetaffinity,function,
+libc.elf,libkernel,scePthreadAttrGetaffinity,function,runtime
 libc.elf,libkernel,scePthreadAttrInit,function,runtime
 libc.elf,libkernel,scePthreadCondBroadcast,function,
 libc.elf,libkernel,scePthreadCondDestroy,function,
@@ -823,7 +823,7 @@ libc.elf,libkernel,scePthreadCondTimedwait,function,
 libc.elf,libkernel,scePthreadCondWait,function,
 libc.elf,libkernel,scePthreadCreate,function,
 libc.elf,libkernel,scePthreadDetach,function,
-libc.elf,libkernel,scePthreadEqual,function,
+libc.elf,libkernel,scePthreadEqual,function,runtime
 libc.elf,libkernel,scePthreadExit,function,
 libc.elf,libkernel,scePthreadGetspecific,function,
 libc.elf,libkernel,scePthreadJoin,function,
@@ -840,8 +840,8 @@ libc.elf,libkernel,scePthreadMutexattrSettype,function,runtime
 libc.elf,libkernel,scePthreadOnce,function,
 libc.elf,libkernel,scePthreadSelf,function,runtime
 libc.elf,libkernel,scePthreadSetspecific,function,
-libc.elf,libkernel,scePthreadYield,function,
-libc.elf,libkernel,sched_yield,function,
+libc.elf,libkernel,scePthreadYield,function,runtime-unresolved
+libc.elf,libkernel,sched_yield,function,runtime
 libc.elf,libkernel,sigfillset,function,
 libc.elf,libkernel,signal,function,
 libc.elf,libkernel,sigprocmask,function,

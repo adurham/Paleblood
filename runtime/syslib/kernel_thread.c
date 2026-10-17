@@ -23,10 +23,18 @@ enum { BSD_ENOMEM = 12, BSD_EINVAL = 22 };
    ORBIS_PTHREAD_CREATE_DETACHED with the same values; it follows FreeBSD's text, so it corroborates
    them rather than measuring them. */
 enum { DETACH_JOINABLE = 0, DETACH_DETACHED = 1 };
+/* The set of CPUs a PS4 application may run on. The APU has eight x86-64 cores; two are reserved
+   for the kernel and system threads, and six are left to applications (PS4 Developer wiki, "APU";
+   Naughty Dog on the console's CPU). The application-visible CPU set is therefore bits 0..5, and a
+   shipped PS4 title spells that out: C4JThread.cpp sets "all cores" to 63 on the __ORBIS__ path
+   (scePthreadAttrSetaffinity(&attr, 63)). A running thread and a freshly initialised attribute
+   both default to that whole set. */
+#define RT_CPU_MASK_USER_ALL UINT64_C(0x3f)
 
 typedef struct {
     void *stack;
     uint64_t stack_size;
+    uint64_t affinity;    /* the cores this thread may run on */
 } guest_thread;
 
 typedef struct {
@@ -35,6 +43,7 @@ typedef struct {
     uint64_t stack_size;
     int has_detach_state;
     int detach_state;
+    uint64_t affinity;    /* the cores the thread it describes may run on */
 } guest_attr;
 
 static int sce(int bsd) { return bsd ? SCE_KERNEL_ERROR(bsd) : 0; }
@@ -46,6 +55,7 @@ void rt_thread_register_main(void *stack, uint64_t stack_size)
 {
     main_thread.stack = stack;
     main_thread.stack_size = stack_size;
+    main_thread.affinity = RT_CPU_MASK_USER_ALL;
     current = &main_thread;
 }
 
@@ -88,6 +98,7 @@ static int attr_init(guest_attr **attr)
     if (!attr) return SCE_KERNEL_ERROR(BSD_EINVAL);
     guest_attr *a = calloc(1, sizeof *a);
     if (!a) return SCE_KERNEL_ERROR(BSD_ENOMEM);
+    a->affinity = RT_CPU_MASK_USER_ALL;
     *attr = a;
     return 0;
 }
@@ -107,7 +118,21 @@ static int attr_destroy(guest_attr **attr)
 static int attr_get(guest_thread *thread, guest_attr **attr)
 {
     if (!thread || !attr || !*attr) return SCE_KERNEL_ERROR(BSD_EINVAL);
-    **attr = (guest_attr){.has_stack = 1, .stack = thread->stack, .stack_size = thread->stack_size};
+    **attr = (guest_attr){.has_stack = 1, .stack = thread->stack, .stack_size = thread->stack_size,
+                          .affinity = thread->affinity};
+    return 0;
+}
+
+/* scePthreadAttrGetaffinity(attr, mask): writes the CPUs the attribute admits to the uint64_t the
+   caller points at. The PS4-visible declaration - an attribute pointer, a mask pointer, an int32_t
+   result - is the public OpenOrbis libkernel.h one. The attribute the game reads comes from
+   scePthreadAttrGet(scePthreadSelf()) as libc.elf starts, or from scePthreadAttrInit, so the whole
+   application CPU set above comes back. 0 on success; a null pointer is EINVAL, as the neighbouring
+   attribute entries report it, and no public SCE source gives another value. */
+static int attr_getaffinity(guest_attr **attr, uint64_t *mask)
+{
+    if (!attr || !*attr || !mask) return SCE_KERNEL_ERROR(BSD_EINVAL);
+    *mask = (*attr)->affinity;
     return 0;
 }
 
@@ -153,3 +178,4 @@ RT_SYSLIB("libkernel", scePthreadAttrSetdetachstate, sce_attr_set_detach_state);
 /* libScePosix: errno values. pthread_attr_init and pthread_attr_destroy are not registered yet, so
    eboot's own POSIX path stops at those first. */
 RT_SYSLIB("libScePosix", pthread_attr_setdetachstate, attr_set_detach_state);
+RT_SYSLIB("libkernel", scePthreadAttrGetaffinity, attr_getaffinity);
