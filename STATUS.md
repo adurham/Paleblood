@@ -31,8 +31,12 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
 
 ## Recent results
 
-- Runtime: `sceKernelGetDirectMemorySize` (libkernel) is implemented. The console's direct memory region is 6 GiB - the public toolchain's `ORBIS_KERNEL_MAIN_DMEM_SIZE`, the console's 8 GiB of unified memory less the 2 GiB the kernel keeps - and the executable uses the result only as the search end of `sceKernelAllocateDirectMemory`. The boot now stops at that call instead
-  (`eboot+0x2081aa3`, 116 MiB at 2 MiB alignment), which needs a direct-memory pool to hand out rather than one number, so it is queued as the memory manager in [NEXT.md](NEXT.md).
+- Runtime: `sceKernelGetDirectMemorySize` (libkernel) is implemented. The console's direct memory
+  region is 6 GiB - the public toolchain's `ORBIS_KERNEL_MAIN_DMEM_SIZE`, the console's 8 GiB of
+  unified memory less the 2 GiB the kernel keeps - and the executable uses the result only as the
+  search end of `sceKernelAllocateDirectMemory`. The boot now stops at that call instead
+  (`eboot+0x2081aa3`, 116 MiB at 2 MiB alignment), which needs a direct-memory pool to hand out
+  rather than one number, so it is queued as the memory manager in [NEXT.md](NEXT.md).
 - Runtime: `scePthreadAttrGetaffinity` (libkernel) is implemented. An attribute reports the CPUs a
   PS4 application may run on - six of the APU's eight cores (mask `0x3f`) - so the game's own libc
   gets past its startup query: the boot reaches the `entry` milestone and stops at
@@ -80,7 +84,6 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
   and the target result and error for a mask that names no core (`scePthreadAttrSetaffinity`, still
   unimplemented and a named diagnostic). A console measurement, or a guest call site that sets a
   strict subset, would close it.
-
 - `sceKernelGetDirectMemorySize` returns the console's documented direct memory region, 6 GiB (`docs/runtime-syscalls.md`, "Direct memory size"). What stays open is the number a console answers a *particular title*: public console logs give the application's share per memory mode (BigApp memory 5248 MiB on a base console, 5888 MiB on a PS4 Pro) and one shipped title expects a share of its own (`0x15f200000`) and halts on anything else. Bloodborne's four call sites only bound an allocation with the value, so the choice cannot change what the boot does; a console measurement of the call would close it.
 
 ## Pipeline health
