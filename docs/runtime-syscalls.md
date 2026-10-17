@@ -27,6 +27,53 @@ The decompiled frame limiter calls `gettimeofday` with a null timezone argument.
 | `scePthreadYield` | Asks for the same yield through the thread library. The PS4-visible signature is not established. | FreeBSD's `pthread_yield(3)` is `void`; Linux's is `int` (always `0`). No PS4-specific public source gives the SCE name's declaration. | Imported by `eboot` and `libc.elf` from `libkernel`; no call site in this repository shows whether the caller reads a result. Registered with `RT_SYSLIB_UNRESOLVED`: the entry stops by name and does not count as implemented. What would settle it: a guest call site showing whether the return register is read after the call, or a PS4-specific public declaration. Do not assume an `int` or `0` from the FreeBSD or Linux analogues. |
 | `memcpy(dest, src, n)`, `memset(dest, c, n)` (libSceLibcInternal) | `void *memcpy(void *, const void *, size_t)` and `void *memset(void *, int, size_t)`, the ISO C declarations. | ISO C 7.24.2.1 and 7.24.6.1: `memcpy` copies `n` bytes from `src` to `dest`; `memset` writes `c` converted to `unsigned char` into the first `n` bytes; both return `dest`. Overlapping `memcpy` regions and null pointers are undefined behaviour. | Imported by `libSceFios2.elf` from `libSceLibcInternal` (`symbols/imports.csv`). Implemented with the host's own functions, since the standard fixes the whole result and no target-specific value is involved (`runtime/syslib/kernel.c`). Not modelled: what the PS4 C library does for the undefined cases; no public source or call site establishes it. |
 | `scePthreadAttrGetaffinity(attr, mask)` | An attribute handle and a pointer to a 64-bit mask, by the public [OpenOrbis `libkernel.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/libkernel.h) declaration `int32_t scePthreadAttrGetaffinity(const OrbisPthreadAttr *, void *)`, whose second argument is commented as an `OrbisKernelCpumask`; a shipped title's `scePthreadGetaffinity(thread, &mask)` passes a `SceKernelCpumask` (`C4JThread.cpp`, the `__ORBIS__` path). | No SCE-specific public source states the result. The neighbouring attribute entries in this repository return `0` on success and an SCE code otherwise, so a null pointer is `EINVAL` here; nothing public gives another value. | Implemented: an attribute reports the CPUs it admits. A PS4 application may run on six of the APU's eight x86-64 cores, the other two being reserved for the kernel and system threads (PS4 Developer wiki, "APU"; Naughty Dog on the console's CPU); the application CPU set is therefore bits 0..5, and the shipped title above spells "all cores" as 63. A running thread and a freshly initialised attribute both default to that whole set. Open: whether the system-created main thread's default mask is exactly this whole set rather than a subset, and the target result and error for a mask that names no core (mask 0) - `scePthreadAttrSetaffinity` remains a named diagnostic that stops the boot. A console measurement, or a guest call site that sets a strict subset, would close it. |
+| `sceKernelGetDirectMemorySize(void)` | No arguments; returns a `size_t`, the console's direct memory size, by the public [OpenOrbis `libkernel.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/libkernel.h) declaration `size_t sceKernelGetDirectMemorySize()`. | OpenOrbis describes the call as getting "the amount of direct memory available for allocation" and returning it. No public source describes an error return or names an argument that could fail, so the entry has no fatal path. | Implemented: returns `0x180000000` (6 GiB), the console's direct memory region as the public toolchain documents it (`ORBIS_KERNEL_MAIN_DMEM_SIZE`: the console's 8 GiB of unified memory less the 2 GiB the kernel keeps). The executable's four call sites (`0x33ea9f`, `0x2081a80`, `0x2081ea4`, `0x26d3ebf`) each pass the result as the `searchEnd` of `sceKernelAllocateDirectMemory(0, size, ...)` and none of them compares, stores or branches on it - the use OpenOrbis's own samples make of the call. Open: the number a console answers a *particular title*, the whole region or that title's own share - public console logs and one shipped title's expectation disagree; see "Direct memory size" below. |
+
+## Direct memory size (`sceKernelGetDirectMemorySize`)
+
+**Observed in our target** (read-only; the eight images verify against `target.sha256`):
+
+- The executable imports the call once, from `libkernel` (NID `pO96TwzOm5E`, `symbols/imports.csv`),
+  and calls it from four places: `0x33ea9f`, `0x2081a80`, `0x2081ea4` and `0x26d3ebf`.
+- Every one of them passes the result straight into `sceKernelAllocateDirectMemory` as its second
+  argument, the `searchEnd` of the area to allocate from, with `searchStart` 0. The site the boot
+  reaches first (`eboot+0x2081a85`) asks for `0x7400000` (116 MiB) at 2 MiB alignment and maps the
+  allocation with `sceKernelMapDirectMemory` next; the others ask for `0x20000` (128 KiB) and for a
+  size the caller computed.
+- No site compares the value with a constant, stores it, or branches on it. What the call has to
+  supply is therefore a bound that covers the region the guest allocates from, and nothing else in
+  the executable reads the number.
+
+**Documented publicly**: OpenOrbis's `libkernel.h` declares `size_t sceKernelGetDirectMemorySize()`,
+and its libkernel page describes the call as getting "the amount of direct memory available for
+allocation". The same page records the console's direct memory under "Direct memory attributes":
+`ORBIS_KERNEL_MAIN_DMEM_SIZE` `0x180000000u` - 6 GiB, the console's 8 GiB of unified memory less the
+2 GiB the kernel keeps (Sony's own statement on the direct/flexible split is the other public
+description of those pools). OpenOrbis's samples pass this call's result as
+`sceKernelAllocateDirectMemory`'s search end, the same use our target makes of it. The runtime
+returns `0x180000000`.
+
+**Inferred, and the premise each inference needs**:
+
+- *A title's share is a property of the console and its memory mode.* Public console kernel logs
+  print the boot memory split per mode and name the application's share: `BigApp memory`
+  `0x148000000` (5248 MiB) or `0x124000000` (4672 MiB) on a base console and `0x170000000`
+  (5888 MiB) on a PS4 Pro, each beside its own flexible maximum (`FMEM (max)`, 64 MiB to 1 GiB) and
+  the smaller `MiniApp DMEM` and `VSH DMEM` pools.
+- *A title can be answered a number of its own.* A public report of a shipped title (`CUSA07820`)
+  has that title expect a direct size of `0x15f200000` (5616 MiB) together with a flexible size of
+  `0xce00000` it declares itself, and halt when emulation answered the whole region instead. That
+  report is evidence about console behaviour, not implementation this repository models; if it is
+  accurate, the answer is the title's share of the application's memory, and it differs per title.
+
+**Unknown**: which of the two a console answers *this* title, and what our runtime should report
+before it has a direct-memory pool at all. The project records no console model of its own, and
+neither the region constant nor the log values are a measurement of the target. Because every call
+site uses the value only as the search bound of an allocation of at most 116 MiB, the choice cannot
+change what the boot does today; it will matter once the runtime hands direct memory out itself,
+when the size reported here and the pool behind it have to agree. What would settle it: a console
+measurement of the call on the target console, a guest site that compares the value (the executable
+has none), or the target's own expected value.
 
 ## Clock IDs and platform differences
 
@@ -186,3 +233,7 @@ Implement the established contract and test the `RT_SYSLIB` entry through its li
 - [POSIX `pthread_attr_setdetachstate`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_attr_getdetachstate.html) - the detach state semantics, the invalid-value error, and the recommended `EINVAL` for an uninitialised attribute
 - [FreeBSD `pthread_attr(3)`](https://man.freebsd.org/cgi/man.cgi?query=pthread_attr_setdetachstate&sektion=3), [libthr `thr_attr.c`](https://cgit.freebsd.org/src/tree/lib/libthr/thread/thr_attr.c) (`_pthread_attr_setdetachstate`, `_pthread_attr_get_np`), [`thr_create.c`](https://cgit.freebsd.org/src/tree/lib/libthr/thread/thr_create.c) (`_pthread_create`: the default attribute for a null or empty variable) and [`include/pthread.h`](https://cgit.freebsd.org/src/tree/include/pthread.h) (`PTHREAD_CREATE_JOINABLE`, `PTHREAD_CREATE_DETACHED`)
 - [OpenOrbis `include/orbis/_types/pthread.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/_types/pthread.h) - the PS4 homebrew SDK's `ORBIS_PTHREAD_CREATE_*` values, which follow FreeBSD's
+- [OpenOrbis PS4 toolchain `libkernel.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/libkernel.h) and [its libkernel page](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/docs/MD/PS4%20Libraries/Libkernel.md) - the `size_t sceKernelGetDirectMemorySize()` declaration, the call's description ("the amount of direct memory available for allocation"), the direct memory attribute `ORBIS_KERNEL_MAIN_DMEM_SIZE` `0x180000000u`, and the sample that passes the call's result as `sceKernelAllocateDirectMemory`'s search end
+- [Digital Foundry, "PlayStation 4 gives up to 5GB of RAM to game developers"](https://www.digitalfoundry.net/articles/digitalfoundry-ps3-system-software-memory) - Sony's statement on the console's "direct" and "flexible" memory pools, and the sizes each was given at launch
+- [PS4 UART boot log with the console's memory-mode breakdown](https://pastebin.com/8TRkDmYW) - "BigApp memory", "FMEM (max)", "MiniApp DMEM" and "VSH DMEM" per memory mode, plus the same breakdown from a PS4 Pro (`Memory mode: 20: GL8 release`, 5888 MiB) in the console-repair threads that quote such logs
+- [shadPS4 issue #789, "The Last Of Us Part II (CUSA07820) sceKernelGetDirectMemorySize Halt"](https://github.com/shadps4-emu/shadPS4/issues/789) - a public report of one shipped title's expected direct and flexible sizes, used here as a statement about console behaviour and not as implementation

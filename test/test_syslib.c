@@ -59,6 +59,7 @@ typedef int (*f_affinity)(void **, uint64_t *);
 typedef int (*f_initattr)(void **);
 typedef int (*f_destroyattr)(void **);
 typedef int (*f_attrget)(void *, void **);
+typedef uint64_t (*f_size)(void);
 
 static void *net_inet_pton_entry;
 static int net_pton_unknown_family(void)
@@ -297,6 +298,15 @@ int main(void)
     CHECK(getaffinity(&one, NULL) == (int)0x80020016);
     CHECK(getaffinity(NULL, &mask) == (int)0x80020016);
     CHECK(attr_destroy_call(&one) == 0);
+
+    /* sceKernelGetDirectMemorySize() takes nothing and returns the size of the console's direct
+       memory region, the pool sceKernelAllocateDirectMemory allocates from. The documented region
+       of the console (see runtime/syslib/kernel.c) bounds every allocation eboot makes with it; the
+       largest observed one asks for 0x7400000 bytes. */
+    const f_size direct_memory_size = (f_size)fn("libkernel", "sceKernelGetDirectMemorySize");
+    CHECK(is_implemented("libkernel", "sceKernelGetDirectMemorySize"));
+    CHECK(direct_memory_size() == UINT64_C(0x180000000));
+    CHECK(direct_memory_size() > UINT64_C(0x7400000));
 
     /* The PS4 host is little-endian AMD64; the network representation is big-endian. */
     CHECK(htonl(UINT32_C(0x12345678)) == UINT32_C(0x78563412));

@@ -620,7 +620,7 @@ eboot,libkernel,sceKernelDeleteEqueue,function,
 eboot,libkernel,sceKernelDeleteSema,function,
 eboot,libkernel,sceKernelFstat,function,
 eboot,libkernel,sceKernelFtruncate,function,
-eboot,libkernel,sceKernelGetDirectMemorySize,function,
+eboot,libkernel,sceKernelGetDirectMemorySize,function,runtime
 eboot,libkernel,sceKernelGetDirectMemoryType,function,
 eboot,libkernel,sceKernelGetProcessTime,function,
 eboot,libkernel,sceKernelGetdirentries,function,

@@ -61,3 +61,24 @@ static void *libc_memset(void *dest, int c, size_t n)
     return memset(dest, c, n);
 }
 RT_SYSLIB("libSceLibcInternal", memset, libc_memset);
+/* sceKernelGetDirectMemorySize: the size of the console's direct memory region, the pool a title
+   allocates from with sceKernelAllocateDirectMemory (they are neighbours in libkernel). Public
+   documentation gives the shape and the region: OpenOrbis declares size_t
+   sceKernelGetDirectMemorySize() and describes it as getting "the amount of direct memory available
+   for allocation", its libkernel page records the direct memory attribute
+   ORBIS_KERNEL_MAIN_DMEM_SIZE 0x180000000u - 6 GiB, the console's 8 GiB of unified memory less the
+   2 the kernel keeps - and OpenOrbis's own samples pass this call's result as the search end of
+   sceKernelAllocateDirectMemory, the same use eboot makes of it.
+
+   Our own call-site inspection of the executable says the same: all four of its calls
+   (0x33ea9f, 0x2081a80, 0x2081ea4, 0x26d3ebf) hand the result straight to
+   sceKernelAllocateDirectMemory(0, size, ...) for at most 116 MiB; none compares it with a
+   constant, stores it, or branches on it, so what the call has to supply is a bound that covers
+   the region the guest allocates from. What a console answers a particular title - the whole
+   region or the title's own share of it - is not public (docs/runtime-syscalls.md, section
+   "Direct memory size"). */
+static uint64_t kernel_get_direct_memory_size(void)
+{
+    return UINT64_C(0x180000000); /* ORBIS_KERNEL_MAIN_DMEM_SIZE: 6 GiB of the console's 8 GiB */
+}
+RT_SYSLIB("libkernel", sceKernelGetDirectMemorySize, kernel_get_direct_memory_size);

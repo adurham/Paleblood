@@ -3,14 +3,14 @@
   "first_unimplemented": {
     "caller": "eboot",
     "library": "libkernel",
-    "nid": "pO96TwzOm5E",
-    "returns_to": "eboot+0x2081a85",
-    "symbol": "sceKernelGetDirectMemorySize"
+    "nid": "rTXw65xmLIA",
+    "returns_to": "eboot+0x2081aa3",
+    "symbol": "sceKernelAllocateDirectMemory"
   },
   "imports_bundled": 219,
-  "imports_called": 24,
-  "imports_implemented": 28,
-  "imports_remaining": 439,
+  "imports_called": 25,
+  "imports_implemented": 29,
+  "imports_remaining": 438,
   "imports_total": 686,
   "imports_unresolved": 4,
   "milestone": "entry",

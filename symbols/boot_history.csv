@@ -4,3 +4,4 @@ date,milestone,milestone_index,imports_total,imports_bundled,imports_implemented
 2026-10-11,loaded,0,686,219,27,440,libc.elf->libkernel:scePthreadAttrGetaffinity,unimplemented,libc.elf,libc.elf+0x81ad5,,,
 2026-10-11,loaded,0,686,219,28,439,libc.elf->libkernel:scePthreadAttrGetaffinity,unimplemented,libc.elf,libc.elf+0x81ad5,,,
 2026-10-17,entry,1,686,219,28,439,eboot->libkernel:sceKernelGetDirectMemorySize,unimplemented,eboot,eboot+0x2081a85,,,
+2026-10-17,entry,1,686,219,29,438,eboot->libkernel:sceKernelAllocateDirectMemory,unimplemented,eboot,eboot+0x2081aa3,,,
