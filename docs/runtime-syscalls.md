@@ -28,6 +28,35 @@ The decompiled frame limiter calls `gettimeofday` with a null timezone argument.
 | `scePthreadAttrGetaffinity(attr, mask)` | An attribute handle and a pointer to a 64-bit mask, by the public [OpenOrbis `libkernel.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/libkernel.h) declaration `int32_t scePthreadAttrGetaffinity(const OrbisPthreadAttr *, void *)`, whose second argument is commented as an `OrbisKernelCpumask`; a shipped title's `scePthreadGetaffinity(thread, &mask)` passes a `SceKernelCpumask` (`C4JThread.cpp`, the `__ORBIS__` path). | No SCE-specific public source states the result. The neighbouring attribute entries in this repository return `0` on success and an SCE code otherwise, so a null pointer is `EINVAL` here; nothing public gives another value. | Implemented: an attribute reports the CPUs it admits. A PS4 application may run on six of the APU's eight x86-64 cores, the other two being reserved for the kernel and system threads (PS4 Developer wiki, "APU"; Naughty Dog on the console's CPU); the application CPU set is therefore bits 0..5, and the shipped title above spells "all cores" as 63. A running thread and a freshly initialised attribute both default to that whole set. Open: whether the system-created main thread's default mask is exactly this whole set rather than a subset, and the target result and error for a mask that names no core (mask 0) - `scePthreadAttrSetaffinity` remains a named diagnostic that stops the boot. A console measurement, or a guest call site that sets a strict subset, would close it. |
 | `sceKernelGetDirectMemorySize(void)` | No arguments; returns a `size_t`, the console's direct memory size, by the public [OpenOrbis `libkernel.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/libkernel.h) declaration `size_t sceKernelGetDirectMemorySize()`. | OpenOrbis describes the call as getting "the amount of direct memory available for allocation" and returning it. No public source describes an error return or names an argument that could fail, so the entry has no fatal path. | Implemented: returns `0x180000000` (6 GiB), the console's direct memory region as the public toolchain documents it (`ORBIS_KERNEL_MAIN_DMEM_SIZE`: the console's 8 GiB of unified memory less the 2 GiB the kernel keeps). The executable's four call sites (`0x33ea9f`, `0x2081a80`, `0x2081ea4`, `0x26d3ebf`) each pass the result as the `searchEnd` of `sceKernelAllocateDirectMemory(0, size, ...)` and none of them compares, stores or branches on it - the use OpenOrbis's own samples make of the call. Open: the number a console answers a *particular title*, the whole region or that title's own share - public console logs and one shipped title's expectation disagree; see "Direct memory size" below. |
 
+| `sceSysmoduleLoadModule(id)`, `sceSysmoduleIsLoaded(id)`, `sceSysmoduleUnloadModule(id)` | One system module id, a `uint16_t`; each returns `int32_t`, by the public [OpenOrbis `Sysmodule.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/Sysmodule.h) declarations `int32_t f(enum OrbisSysModule moduleId)`, the enum being `uint16_t` ([`_types/sysmodule.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/_types/sysmodule.h)). | OpenOrbis documents each as "0 = Success/Valid or Negatives values are error codes"; no public source gives the error values. | Implemented for the modules `game/modules.csv` lists with action `stub`: a load marks the module loaded and succeeds without mapping anything, a query of a loaded one answers 0, an unload clears the mark. Everything else stops by name: a module that is not a stub (the runtime cannot load system modules yet), a second load of a loaded stub (whether the system counts loads is not public), and a query or unload of a stub that is not loaded (the "not loaded" error value is not public). See "Module loading at run time" below. |
+
+## Module loading at run time (`libSceSysmodule`)
+
+**Observed in our target**: the executable imports `sceSysmoduleLoadModule`, `sceSysmoduleIsLoaded`
+and `sceSysmoduleUnloadModule` from `libSceSysmodule`; its shipped file I/O module imports the load
+and unload calls too. Neither imports `sceKernelLoadStartModule` or another loader entry
+(`symbols/imports.csv`), so a module is asked for by its system module id and nothing else. Five of
+the seven modules the title ships are listed with action `stub` in `game/modules.csv`, which records
+that the executable imports nothing from them; they are not mapped.
+
+**Documented publicly**: the OpenOrbis toolchain's id list (`include/orbis/_types/sysmodule.h`,
+after psdevwiki's "Libraries" page) names the ids of those five: `ORBIS_SYSMODULE_FACE` `0x0038`,
+`ORBIS_SYSMODULE_SMART` `0x0039`, `ORBIS_SYSMODULE_S3DCONVERSION` `0x0086`, `ORBIS_SYSMODULE_HAND`
+`0x0093` and `ORBIS_SYSMODULE_HEAD_TRACKER` `0x00cb`. They are recorded in the `sysmodule` column
+of `game/modules.csv`; the runtime itself names no module (`tools/check_agnostic.py`):
+`tools/boot.py` passes each stub to `pbboot` as `--stub-module ID:NAME`, and the run's status
+(`stub_modules` in `symbols/boot.json`) says which of them the guest loaded.
+
+**Inferred**: *if* nothing we map imports from a stub (as `game/modules.csv` records for the
+executable), answering the load without mapping the module cannot leave a call unbound; an import
+it would have satisfied still shows up unbound in `symbols/imports.csv` and stops the boot by name. Whether the executable's sites check the result
+beyond success, and which ids they pass, is not yet observed: the boot stops before the first load
+today.
+
+**Unknown**: the error values (a module not loaded, an id the system does not know), and whether a
+second load of a loaded module is counted, ignored or refused. Each is a named fatal until a console
+measurement or a guest call site settles it.
+
 ## Direct memory size (`sceKernelGetDirectMemorySize`)
 
 **Observed in our target** (read-only; the eight images verify against `target.sha256`):
@@ -184,6 +213,7 @@ Implement the established contract and test the `RT_SYSLIB` entry through its li
 - [PSP2SDK `psp2/net/netctl.h` file reference](https://psp2sdk.github.io/netctl_8h.html) and [vitasdk `SceNetCtl` user group](https://docs.vitasdk.org/group__SceNetCtlUser.html) - the same declarations, with no prose describing any return value in this group
 - [vitasdk/vita-headers `psp2/error.h`](https://github.com/vitasdk/vita-headers/blob/master/include/psp2/error.h) - `0 on success` as the documented SCE-family return convention
 - [OpenOrbis PS4 toolchain `libkernel.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/libkernel.h) and [its libkernel page](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/docs/MD/PS4%20Libraries/Libkernel.md) - the `size_t sceKernelGetDirectMemorySize()` declaration, the call's description ("the amount of direct memory available for allocation"), the direct memory attribute `ORBIS_KERNEL_MAIN_DMEM_SIZE` `0x180000000u`, and the sample that passes the call's result as `sceKernelAllocateDirectMemory`'s search end
+- [OpenOrbis PS4 toolchain `Sysmodule.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/Sysmodule.h) and [`_types/sysmodule.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/_types/sysmodule.h) - the `sceSysmoduleLoadModule`, `sceSysmoduleIsLoaded` and `sceSysmoduleUnloadModule` declarations and return convention, and the system module ids (after [psdevwiki, "Libraries"](https://www.psdevwiki.com/ps4/Libraries))
 - [Digital Foundry, "PlayStation 4 gives up to 5GB of RAM to game developers"](https://www.digitalfoundry.net/articles/digitalfoundry-ps3-system-software-memory) - Sony's statement on the console's "direct" and "flexible" memory pools, and the sizes each was given at launch
 - [PS4 UART boot log with the console's memory-mode breakdown](https://pastebin.com/8TRkDmYW) - "BigApp memory", "FMEM (max)", "MiniApp DMEM" and "VSH DMEM" per memory mode, plus the same breakdown from a PS4 Pro (`Memory mode: 20: GL8 release`, 5888 MiB) in the console-repair threads that quote such logs
 - [shadPS4 issue #789, "The Last Of Us Part II (CUSA07820) sceKernelGetDirectMemorySize Halt"](https://github.com/shadps4-emu/shadPS4/issues/789) - a public report of one shipped title's expected direct and flexible sizes, used here as a statement about console behaviour and not as implementation

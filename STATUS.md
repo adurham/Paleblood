@@ -31,6 +31,15 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
 
 ## Recent results
 
+- Runtime: module loading at run time. `sceSysmoduleLoadModule` (libSceSysmodule, the only way the
+  executable asks for a module) reports a module listed with action `stub` in `game/modules.csv`
+  loaded without mapping it; `sceSysmoduleIsLoaded` and `sceSysmoduleUnloadModule` answer for it
+  too. The ids are the public system module ids (OpenOrbis toolchain, after psdevwiki), recorded in
+  the new `sysmodule` column; `tools/boot.py` passes them to `pbboot` as `--stub-module ID:NAME`, so
+  `runtime/` still names no module, and `symbols/boot.json` gains `stub_modules` (which were
+  loaded). Not yet re-run on the executable: the boot should still stop at
+  `sceKernelAllocateDirectMemory`, with the executable's three libSceSysmodule imports now counted
+  as implemented by the runtime.
 - Runtime: `sceKernelGetDirectMemorySize` (libkernel) is implemented. The console's direct memory
   region is 6 GiB - the public toolchain's `ORBIS_KERNEL_MAIN_DMEM_SIZE`, the console's 8 GiB of
   unified memory less the 2 GiB the kernel keeps - and the executable uses the result only as the
@@ -85,6 +94,13 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
   unimplemented and a named diagnostic). A console measurement, or a guest call site that sets a
   strict subset, would close it.
 - `sceKernelGetDirectMemorySize` returns the console's documented direct memory region, 6 GiB (`docs/runtime-syscalls.md`, "Direct memory size"). What stays open is the number a console answers a *particular title*: public console logs give the application's share per memory mode (BigApp memory 5248 MiB on a base console, 5888 MiB on a PS4 Pro) and one shipped title expects a share of its own (`0x15f200000`) and halts on anything else. Bloodborne's four call sites only bound an allocation with the value, so the choice cannot change what the boot does; a console measurement of the call would close it.
+
+- Module loading (`libSceSysmodule`): the error values (a module not loaded, an id the system does
+  not know) and whether a second load of a loaded module is counted or refused are not public, so
+  each stops the boot by name; so does a module that is not a stub, since the runtime cannot load a
+  system module yet. Which ids the executable passes, and whether it reads more than success, is
+  unobserved until the boot gets past direct memory (`docs/runtime-syscalls.md`, "Module loading at
+  run time").
 
 ## Pipeline health
 

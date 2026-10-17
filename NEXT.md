@@ -18,9 +18,7 @@ what the boot stops at, clean room (CONTRIBUTING.md), then re-runs `tools/boot.p
    (STYLE.md forbids recording code under `game/`). This replaces the per-function recorders that
    were removed, so in-game recordings resume once the runtime runs the game, and
    `tools/promote.py` can move `edge-verified` functions to `verified`.
-2. Module loading at run time: when the game asks to load a module listed with action `stub` in
-   `game/modules.csv`, report it loaded without mapping it.
-3. Direct memory: `sceKernelAllocateDirectMemory` (which the boot now stops at: eboot asks it for
+2. Direct memory: `sceKernelAllocateDirectMemory` (which the boot now stops at: eboot asks it for
    116 MiB at 2 MiB alignment, `eboot+0x2081aa3`) with `sceKernelMapDirectMemory`,
    `sceKernelReleaseDirectMemory` and the pool they work on. This is the memory manager rather
    than one value: the region `sceKernelGetDirectMemorySize` reports, the physical addresses the
@@ -49,6 +47,11 @@ from the smallest up. New functions go to `main` only verified and readable.
 
 ## Done
 
+- Runtime: module loading at run time (libSceSysmodule `sceSysmoduleLoadModule`,
+  `sceSysmoduleIsLoaded`, `sceSysmoduleUnloadModule`): a module `game/modules.csv` lists with action
+  `stub`, now with its system module id, is reported loaded without being mapped; any other module,
+  a second load and the "not loaded" answers stop by name. The boot still stops at
+  `sceKernelAllocateDirectMemory`, before the first load.
 - Runtime: libkernel `sceKernelGetProcParam`, `_sceKernelRtldSetApplicationHeapAPI`, the mutex and mutex attribute functions (SCE and POSIX names), `scePthreadSelf` and thread attributes (init, destroy, get).
 - Runtime: libkernel `scePthreadAttrGetaffinity`: an attribute reports the six-core application CPU
   set (mask `0x3f`); the boot now reaches the `entry` milestone and stops at
