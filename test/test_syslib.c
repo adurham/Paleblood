@@ -54,6 +54,10 @@ typedef int (*f_equal)(void *, void *);
 typedef uint32_t (*f_u32_u32)(uint32_t);
 typedef uint16_t (*f_u16_u16)(uint16_t);
 typedef int (*f_inet_pton)(int, const char *, void *);
+typedef int (*f_affinity)(void **, uint64_t *);
+typedef int (*f_initattr)(void **);
+typedef int (*f_destroyattr)(void **);
+typedef int (*f_attrget)(void *, void **);
 
 static void *net_inet_pton_entry;
 static int net_pton_unknown_family(void)
@@ -198,6 +202,37 @@ int main(void)
     void (*pthread_yield_entry)(void) = (void (*)(void))fn("libkernel", "scePthreadYield");
     CHECK(died_in_fatal(pthread_yield_entry));
     CHECK(!is_implemented("libkernel", "scePthreadYield"));
+
+    /* scePthreadAttrGetaffinity(attr, mask) reads the CPUs an attribute admits. The value the game
+       counts as libc.elf starts is the whole application CPU set: the six cores of the PS4's eight
+       that are left to applications (see runtime/syslib/kernel_thread.c). */
+    const f_affinity getaffinity = (f_affinity)fn("libkernel", "scePthreadAttrGetaffinity");
+    const f_initattr attr_init_call = (f_initattr)fn("libkernel", "scePthreadAttrInit");
+    const f_destroyattr attr_destroy_call = (f_destroyattr)fn("libkernel", "scePthreadAttrDestroy");
+    const f_attrget attr_get_call = (f_attrget)fn("libkernel", "scePthreadAttrGet");
+    CHECK(is_implemented("libkernel", "scePthreadAttrGetaffinity"));
+    uint64_t mask = 0;
+
+    /* an attribute taken from the running thread carries its CPU set */
+    void *attrs = NULL;
+    CHECK(attr_init_call(&attrs) == 0 && attrs);
+    CHECK(attr_get_call(self, &attrs) == 0);
+    CHECK(getaffinity(&attrs, &mask) == 0 && mask == UINT64_C(0x3f));
+    CHECK(attr_destroy_call(&attrs) == 0 && attrs == NULL);
+
+    /* a fresh attribute defaults to the same whole set */
+    void *fresh = NULL;
+    mask = 0;
+    CHECK(attr_init_call(&fresh) == 0 && fresh);
+    CHECK(getaffinity(&fresh, &mask) == 0 && mask == UINT64_C(0x3f));
+    CHECK(attr_destroy_call(&fresh) == 0);
+
+    /* a null attribute or mask is EINVAL, the value the neighbouring entries report */
+    void *one = NULL;
+    CHECK(attr_init_call(&one) == 0);
+    CHECK(getaffinity(&one, NULL) == (int)0x80020016);
+    CHECK(getaffinity(NULL, &mask) == (int)0x80020016);
+    CHECK(attr_destroy_call(&one) == 0);
 
     /* The PS4 host is little-endian AMD64; the network representation is big-endian. */
     CHECK(htonl(UINT32_C(0x12345678)) == UINT32_C(0x78563412));

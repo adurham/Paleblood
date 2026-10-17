@@ -18,11 +18,10 @@ what the boot stops at, clean room (CONTRIBUTING.md), then re-runs `tools/boot.p
    (STYLE.md forbids recording code under `game/`). This replaces the per-function recorders that
    were removed, so in-game recordings resume once the runtime runs the game, and
    `tools/promote.py` can move `edge-verified` functions to `verified`.
-2. `scePthreadAttrGetaffinity` (libkernel), called by the game's own libc while it starts: needs
-   the main thread's CPU affinity mask on a PS4 (STATUS.md, "Open questions"). Then the next
-   import `tools/boot.py` names.
-3. Module loading at run time: when the game asks to load a module listed with action `stub` in
+2. Module loading at run time: when the game asks to load a module listed with action `stub` in
    `game/modules.csv`, report it loaded without mapping it.
+3. `sceKernelGetDirectMemorySize` (libkernel), called by eboot: needs the direct memory size of a
+   PS4 (STATUS.md, "Open questions"). Then the next import `tools/boot.py` names.
 
 Roadmap after the boot gets going: kernel, threads and memory; files; input; audio; video
 out; GNM and shaders (the largest). Claimable work per system call group is in the issues
@@ -47,6 +46,9 @@ from the smallest up. New functions go to `main` only verified and readable.
 ## Done
 
 - Runtime: libkernel `sceKernelGetProcParam`, `_sceKernelRtldSetApplicationHeapAPI`, the mutex and mutex attribute functions (SCE and POSIX names), `scePthreadSelf` and thread attributes (init, destroy, get).
+- Runtime: libkernel `scePthreadAttrGetaffinity`: an attribute reports the six-core application CPU
+  set (mask `0x3f`); the boot now reaches the `entry` milestone and stops at
+  `sceKernelGetDirectMemorySize` (libkernel, called by eboot).
 - Runtime: the game's own libc and libSceFios2 modules are mapped as guest code (`game/modules.csv`) and the executable's imports they export are bound to them; their functions are tracked in `symbols/module_functions.csv`, replaceable later like game functions.
 - Runtime: our own loader (`runtime/loader.c`) and boot harness (`runtime/boot.c`, `tools/boot.py`); the verification harness maps the executable with the loader.
 
