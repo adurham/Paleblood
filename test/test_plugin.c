@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include "runtime/guest.h"
 #include "runtime/hooks.h"
 #include "runtime/host.h"
@@ -21,7 +23,8 @@ static unsigned char *probe_image;
 static uint64_t probe_size;
 static int probe_error;
 
-static void replacement_one(void) {}
+static int replacement_one_calls;
+static void replacement_one(void) { replacement_one_calls++; }
 static void replacement_two(void) {}
 
 const rt_hook_entry game_hooks[] = {
@@ -82,7 +85,10 @@ int main(void)
                     "unsupported host must not install hooks or probes");
     host.version = RT_HOST_API_VERSION;
 
+    /* BB_CALL_CAPTURE_DIR is unset: every hook below gets the replacement itself, as before call
+       capture existed. */
     reset_observations();
+    failed |= check(unsetenv("BB_CALL_CAPTURE_DIR") == 0, "call capture must start off");
     failed |= check(bbgame_init(&host) == 0, "compatible host must initialize");
     failed |= check(installed_count == 2, "compatible host must receive both hooks");
     failed |= check(installed[0].offset == 0x1000 && installed[0].size == 8 &&
@@ -124,6 +130,40 @@ int main(void)
     failed |= check(bbgame_init(&host) != 0, "probe installation failure must be returned");
     failed |= check(installed_count == 2 && probe_count == 1,
                     "probe failure must occur after hooks are installed");
+
+    /* With call capture on, a wanted hook gets a recording thunk that still runs its replacement;
+       the others keep the replacement itself (runtime/call_capture.h). */
+    reset_observations();
+    const char *tmp = getenv("TMPDIR");
+    char dir[512], path[600];
+    snprintf(dir, sizeof dir, "%s/pb-plugin-capture-XXXXXX", tmp && *tmp ? tmp : "/tmp");
+    failed |= check(mkdtemp(dir) != NULL, "a temporary capture directory must be created");
+    setenv("BB_CALL_CAPTURE_DIR", dir, 1);
+    setenv("BB_CALL_CAPTURE_ONLY", "replacement_one", 1);
+    setenv("BB_CAPTURE_RUN", "plugin-test", 1);
+    failed |= check(bbgame_init(&host) == 0, "host must initialize with call capture on");
+    failed |= check(installed_count == 2 && installed[0].target != (const void *)replacement_one &&
+                    installed[1].target == (const void *)replacement_two,
+                    "only the wanted hook must go through a recording thunk");
+    if (installed_count == 2 && installed[0].target) {
+        ((void (*)(void))installed[0].target)();
+        failed |= check(replacement_one_calls == 1, "the thunk must run the replacement");
+    }
+    snprintf(path, sizeof path, "%s/replacement_one/plugin-test.calls.jsonl", dir);
+    FILE *record = fopen(path, "r");
+    char line[4096] = "";
+    failed |= check(record && fgets(line, sizeof line, record) &&
+                    strstr(line, "\"name\": \"replacement_one\""),
+                    "the call must be recorded under the hook's name");
+    if (record)
+        fclose(record);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/replacement_one", dir);
+    rmdir(path);
+    rmdir(dir);
+    unsetenv("BB_CALL_CAPTURE_DIR");
+    unsetenv("BB_CALL_CAPTURE_ONLY");
+    unsetenv("BB_CAPTURE_RUN");
 
     return failed ? 1 : 0;
 }

@@ -12,6 +12,9 @@
    (runtime/syslib.h), else to a trampoline that stops the run and names it. Each module's entry
    (its constructors, then its start function) runs before the executable's entry.
 
+   With BB_CALL_CAPTURE_DIR set, each bound import's trampoline goes through a recording thunk
+   named after the import, so its calls' registers are recorded by name (runtime/call_capture.h).
+
    Every import call is counted, so the run also reports the boot milestones reached: the first
    call to each milestone's system functions (threads, files, input, audio, video out, GPU
    submission, the first flip; the runtime roadmap's order). Faults and timeouts are caught and
@@ -20,6 +23,7 @@
    Names: an import is "NID#library#module"; library names come from the object, symbol names
    from a public NID database (--nids, default $BB_NID_DB), else the NID is shown. */
 #define _GNU_SOURCE
+#include "runtime/call_capture.h"
 #include "runtime/loader.h"
 #include "runtime/nid.h"
 #include "runtime/process.h"
@@ -305,6 +309,22 @@ static void where(uint64_t address, char *out, size_t size)
     snprintf(out, size, "host+0x%llx", (unsigned long long)address);
 }
 
+/* A bound import's target. With BB_CALL_CAPTURE_DIR set it is a recording thunk named after the
+   import, "library.symbol" (the NID when the database has no name); otherwise the provider itself
+   (runtime/call_capture.h). An unbound import stays unbound: its trampoline stops the run. */
+static void *import_target(const object *o, size_t i)
+{
+    if (!o->bound[i] || !rt_call_capture_enabled())
+        return o->bound[i];
+    const char *name = rt_elf_import_name(o->elf, i), *sym = symbol_of(name);
+    const char *library = rt_elf_import_library(o->elf, i);
+    char nid[RT_NID_SIZE], label[256];
+    memcpy(nid, name, RT_NID_SIZE - 1);
+    nid[RT_NID_SIZE - 1] = 0;
+    snprintf(label, sizeof label, "%s.%s", library ? library : "unknown", sym ? sym : nid);
+    return rt_call_capture_wrap(label, o->bound[i]);
+}
+
 static const char *usage =
     "usage: pbboot EBOOT.elf [--module MODULE.elf]... [--nids NID_DB.xml] [--status OUT.json] [--timeout S] [--trace]\n"
     "       pbboot EBOOT.elf [--module MODULE.elf]... --imports [--nids NID_DB.xml]\n";
@@ -399,7 +419,7 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < o->imports; i++)
             if (rt_elf_import_kind(o->elf, i) == RT_ELF_IMPORT_FUNCTION)
                 write_trampoline(o->tramp + i * TRAMPOLINE_SIZE, &o->called[i], (uint32_t)(k << 20 | i),
-                                 (uint64_t)(uintptr_t)o->bound[i]);
+                                 (uint64_t)(uintptr_t)import_target(o, i));
         if (rt_elf_map(o->elf, o->image, bind_import, o, error, sizeof error)) {
             fprintf(stderr, "pbboot: %s\n", error);
             return 3;

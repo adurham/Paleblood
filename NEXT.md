@@ -17,7 +17,10 @@ what the boot stops at, clean room (CONTRIBUTING.md), then re-runs `tools/boot.p
    memory it reads, its calls' results) from the runtime side, with no code in the function
    (STYLE.md forbids recording code under `game/`). This replaces the per-function recorders that
    were removed, so in-game recordings resume once the runtime runs the game, and
-   `tools/promote.py` can move `edge-verified` functions to `verified`.
+   `tools/promote.py` can move `edge-verified` functions to `verified`. Arguments and results are
+   recorded by name (`runtime/call_capture.c`, opt-in); the memory a function reads and turning
+   records into cases wait on the maintainer's case-format decision (STATUS.md, "Decisions
+   needed: generic capture").
 2. Module loading at run time: when the game asks to load a module listed with action `stub` in
    `game/modules.csv`, report it loaded without mapping it.
 3. Direct memory: `sceKernelAllocateDirectMemory` (which the boot now stops at: eboot asks it for

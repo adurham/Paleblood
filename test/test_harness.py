@@ -647,6 +647,31 @@ class Harness(unittest.TestCase):
                                    function='synthetic_function')
         self.assertEqual(len(results['original']), 1)
 
+    def test_call_capture_records_are_not_cases(self):
+        # The runtime's generic call capture (runtime/call_capture.h) writes registers by name,
+        # not schema-1 cases: verify.py, the harness's batch mode and promote.py must not take a
+        # record file for a case, even in a function's case directory.
+        record = {'name': 'synthetic_function', 'run_id': 'test-run_1', 'call': 0, 'record': 0,
+                  'from': '0x1', 'args': {'rdi': '0x900000000'}, 'returns': {'rax': '0x0'}}
+        caps = os.path.join(self.d, 'caps')
+        os.makedirs(caps)
+        with open(os.path.join(caps, 'test-run_1.calls.jsonl'), 'w') as f:
+            f.write(json.dumps(record) + '\n')
+        lib = self.build(False)
+        with self.assertRaisesRegex(verify.BadInput, 'no case files'):
+            verify.run_cases(self.boot, caps, '0x00400000', 'replacement', lib)
+        import promote
+        self.assertEqual(promote.cases(caps), 0)
+        with open(os.path.join(caps, 'case.json'), 'w') as f:
+            json.dump(CASE, f)
+        results = verify.run_cases(self.boot, caps, '0x00400000', 'replacement', lib)
+        self.assertEqual([len(results['original']), len(results['replacement'])], [1, 1])
+        cmd = [sys.executable, os.path.join(TOOLS, 'harness.py'), '--elf', self.boot,
+               '--cases', caps, '--address', '0x00400000']
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(list(json.loads(r.stdout)), ['case'])
+
     def test_direct_harness_rejects_wrong_case_address(self):
         wrong = dict(CASE, address='0x00400800')
         with open(self.case, 'w') as f:
