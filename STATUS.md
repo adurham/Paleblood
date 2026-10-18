@@ -43,18 +43,34 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
   the memory manager in [NEXT.md](NEXT.md) and is implemented since.
 - Runtime: generic call capture (`runtime/call_capture.c`, NEXT.md runtime target 1, first part).
   Off unless `BB_CALL_CAPTURE_DIR` is set, and then nothing changes for a name it does not wrap
-  (`BB_CALL_CAPTURE_ONLY`). When on, `bbgame_init` installs every hook through a recording thunk,
-  and `pbboot` sends every bound import's trampoline through one named `library.symbol`. The thunk
-  records the call's argument registers (rdi..r9, al, ymm0..ymm7) and return registers (rax, rdx,
-  ymm0, ymm1), sampled like the old recorders (first 50 calls per name, then every 1000th, at most
-  200), as JSON lines in `$BB_CALL_CAPTURE_DIR/<name>/<run>.calls.jsonl`. It moves the caller's
-  return address to a per-thread shadow stack so stack arguments stay where the caller put them.
+  (`BB_CALL_CAPTURE_ONLY`; this filters call records only - `BB_CAPTURE_ONLY` is the case writer's
+  separate filter, and the two share only the run id, `BB_CAPTURE_RUN`). When on, `bbgame_init`
+  installs every hook through a recording thunk, and `pbboot` sends the trampoline of every import
+  the runtime implements through one named `library.symbol`; imports bound to a bundled module's
+  export are not wrapped (guest code there can return twice or unwind, which the thunk cannot carry).
+  The thunk records the call's argument registers (rdi..r9, al, ymm0..ymm7) and return registers
+  (rax, rdx, ymm0, ymm1, and st0/st1 when they hold a long double result), sampled like the old
+  recorders (first 50 calls per name, then every 1000th, at most 200), as JSON lines in
+  `$BB_CALL_CAPTURE_DIR/<name>/<run>.calls.jsonl`. It moves the caller's return address into a
+  per-thread call frame so stack arguments stay where the caller put them, and finds the frame again
+  through rbx and r12 (callee-saved), not by stack order.
+  Hardened after an independent verification (branch `claude/verify-call-capture-r7k2qx`): longjmp
+  out of wrapped calls, C++ exceptions thrown by host code through them (the thunk has unwind
+  information), thread exit inside them, tail calls between them and recursion deeper than the old
+  fixed 1024 frames all return to the right place; a call left without returning is noted (a
+  warning per name, and a record with `"returns": null` if it was sampled) when the next wrapped
+  call enters at its stack slot or the thread exits. Per thread, up to 2^20 wrapped calls can be in
+  progress or left unnoted; past that, or out of memory, calls run unrecorded with a warning. A
+  target that returns twice (setjmp) cannot be wrapped: its second return stops the process with a
+  message. The thunk saves the x87 state around its record write.
   What it does not do: discover the memory a function reads (nothing is recorded behind a
-  pointer), record stack arguments (their count is unknown without a signature), or record a call
-  that does not return (longjmp, exit). The records are not schema-1 cases and live outside the
-  case library, so `tools/verify.py` and `tools/promote.py` do not read them; for most functions
+  pointer), record stack arguments (their count is unknown without a signature), zmm upper halves
+  or the x87/SSE control state. The records are not schema-1 cases and live outside the case
+  library, so `tools/verify.py` and `tools/promote.py` do not read them; for most functions
   `tools/promote.py` still cannot move `edge-verified` to `verified` until the decisions below are
-  made. Needs an AVX host (it saves whole ymm registers); without one it warns and wraps nothing.
+  made. Needs an AVX host (it saves whole ymm registers) that allows writable and executable
+  mappings (the stubs are mapped RWX; under SELinux `deny_execmem` or similar the mapping fails);
+  without either it warns and wraps nothing.
 - Runtime: `sceKernelGetDirectMemorySize` (libkernel) is implemented. The console's direct memory
   region is 6 GiB - the public toolchain's `ORBIS_KERNEL_MAIN_DMEM_SIZE`, the console's 8 GiB of
   unified memory less the 2 GiB the kernel keeps - and the executable uses the result only as the
@@ -113,10 +129,37 @@ unchanged.
   recorded memory by hand (`buf:`/`guest:`); generic capture would need either per-function
   descriptors or memory replay at the original host addresses. Which one is a case-format decision.
 - **Conversion.** No tool turns call records into cases; one would need both decisions above.
-- **`docs/capture-architecture.md`** rates an assembly trampoline "not the first implementation"
-  and says production hooks remain unchanged. The thunk is opt-in and off by default, but it is an
-  assembly trampoline on production hooks; the page is left as written for the maintainer to
-  update.
+- **The assembly trampoline itself (open, needs sign-off).** `docs/capture-architecture.md` rates
+  an assembly trampoline "not the first implementation" and says a production path needs "a
+  separately reviewed design and ABI tests" covering unwind behaviour, signal and exception paths,
+  per-thread nesting and recursion. The thunk is opt-in and off by default, but it is an assembly
+  trampoline on production hooks and runtime imports; the page is left as written for the
+  maintainer. Capture runs (`BB_CALL_CAPTURE_DIR` set) carry the risks below until the maintainer
+  signs the approach off or replaces it; default runs do not. The independent verification
+  (`VERIFY-call-capture.md` on `claude/verify-call-capture-r7k2qx`, of `4c4c92c`) found, ranked:
+  D1 (high) non-local exits through a wrapped frame crashed the run; D2 (medium) the fixed
+  1024-frame depth aborted deep recursion and long longjmp-heavy runs; D3 (medium) this
+  disagreement with the page; D4 (low) x87 results unrecorded and st0 live across a C call; D5 (low)
+  a freed shadow stack still reachable at thread exit; D6 (low) RWX stubs; D7 (info) untested exits,
+  depth, threads and write failures; D8 (info) the two `_ONLY` filters. D1, D2, D4, D5 and D7 are
+  fixed and tested, D6 and D8 documented; D3 is this decision. What remains, in the order of the
+  harm it can do:
+  - A guest unwinder cannot read the host's unwind information, so a guest C++ exception must not
+    cross a thunk. Hooks are host replacements and pbboot no longer wraps module exports, so no
+    wrapped path crosses guest unwinding today; a future host path that does would break it.
+  - A wrapped function that returns twice (setjmp-like) stops the process (with a message, never a
+    wrong return). Nothing wrapped today is such a function; it is excluded by provider (module
+    exports), not by name.
+  - A frame is matched to its return through rbx and r12; a target that breaks the System V rule
+    and does not preserve them stops the process or, if it leaves a stale frame pointer, could crash.
+    A target that overwrites its own return-address slot, or switches stacks and reuses one stack
+    slot for a still-running call, breaks the "same slot means the earlier call was left" rule.
+  - A signal handler on the same thread that makes a wrapped call while the thunk is inside its
+    enter or leave helper can corrupt that thread's call frames (no signal masking).
+  - Only ymm0..ymm7 are saved: a host replacement taking `__m512` arguments on an AVX-512 host
+    loses their upper halves (the guest CPU has no AVX-512, QUIRKS.md).
+  - Left calls are noted late (at the next call entering the same slot or at the thread's exit), so
+    a run that ends with such calls open does not record them.
 
 ## Open questions (runtime)
 

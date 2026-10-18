@@ -12,8 +12,11 @@
    (runtime/syslib.h), else to a trampoline that stops the run and names it. Each module's entry
    (its constructors, then its start function) runs before the executable's entry.
 
-   With BB_CALL_CAPTURE_DIR set, each bound import's trampoline goes through a recording thunk
-   named after the import, so its calls' registers are recorded by name (runtime/call_capture.h).
+   With BB_CALL_CAPTURE_DIR set, the trampoline of each import the runtime implements goes through a
+   recording thunk named after the import, so its calls' registers are recorded by name
+   (runtime/call_capture.h). Imports bound to a module's export are not wrapped: guest code can
+   return twice (setjmp) or unwind (C++ exceptions) through them, and neither is safe across the
+   thunk.
 
    Every import call is counted, so the run also reports the boot milestones reached: the first
    call to each milestone's system functions (threads, files, input, audio, video out, GPU
@@ -309,12 +312,15 @@ static void where(uint64_t address, char *out, size_t size)
     snprintf(out, size, "host+0x%llx", (unsigned long long)address);
 }
 
-/* A bound import's target. With BB_CALL_CAPTURE_DIR set it is a recording thunk named after the
-   import, "library.symbol" (the NID when the database has no name); otherwise the provider itself
-   (runtime/call_capture.h). An unbound import stays unbound: its trampoline stops the run. */
+/* A bound import's target. With BB_CALL_CAPTURE_DIR set and the runtime as its provider it is a
+   recording thunk named after the import, "library.symbol" (the NID when the database has no
+   name); otherwise the provider itself (runtime/call_capture.h). A module's export is never
+   wrapped: the thunk cannot tell a guest function that returns twice or unwinds through its caller
+   (setjmp, a C++ throw), and a guest unwinder cannot read the thunk's unwind information. An
+   unbound import stays unbound: its trampoline stops the run. */
 static void *import_target(const object *o, size_t i)
 {
-    if (!o->bound[i] || !rt_call_capture_enabled())
+    if (!o->bound[i] || !rt_call_capture_enabled() || o->provider[i] == MODULE)
         return o->bound[i];
     const char *name = rt_elf_import_name(o->elf, i), *sym = symbol_of(name);
     const char *library = rt_elf_import_library(o->elf, i);

@@ -40,7 +40,8 @@ set_tests_properties(capture_poc_replay PROPERTIES
     ENVIRONMENT "CC=${CMAKE_C_COMPILER};BB_LOADER=$<TARGET_FILE:pbloader>")
 # System library implementations, compiled in directly so the linker keeps every RT_SYSLIB entry
 file(GLOB PB_TEST_SYSLIB CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/runtime/syslib/*.c)
-add_executable(test_syslib test/test_syslib.c runtime/process.c runtime/call_capture.c ${PB_TEST_SYSLIB})
+add_executable(test_syslib test/test_syslib.c test/test_call_capture_unwind.cpp runtime/process.c runtime/call_capture.c
+    ${PB_TEST_SYSLIB})
 target_include_directories(test_syslib PRIVATE runtime/include)
 add_test(NAME syslib COMMAND test_syslib)
 # The direct memory pool on its own: no operating system calls, so it is tested wherever the
