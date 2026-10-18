@@ -549,6 +549,43 @@ class Boot(unittest.TestCase):
         finally:
             shutil.rmtree(d)
 
+    def test_call_capture_leaves_module_exports_unwrapped(self):
+        # An import bound to a bundled module's export is guest code that may return twice or
+        # unwind through its caller, so call capture never wraps it (runtime/boot.c): the call
+        # returns as without capture and nothing is recorded.
+        import harness
+        import ps4elf
+        f = harness.nid('f') + '#B#A'
+        code = bytearray(0x1000)
+        code[:7] = b'\xff\x15' + struct.pack('<i', 0x1000 - 6) + b'\xc3'      # call [import slot]; ret
+        exe = ps4elf.build(segments=[(0, bytes(code), 0x1000, 5), (0x1000, bytes(8), 0x1000, 6)],
+                           symbols=[(f, ps4elf.STT_FUNC, None)], relocations=[],
+                           jump_slots=[(0x1000, ps4elf.R_X86_64_JUMP_SLOT, 1, 0)],
+                           libraries=[(ps4elf.DT_SCE_IMPORT_LIB, 'libfoo', 1)])
+        mcode = bytearray(0x1000)
+        mcode[0] = 0xc3                                       # the module's entry: ret
+        mcode[0x40:0x46] = b'\xb8\x2a\x00\x00\x00\xc3'      # f: mov eax, 42; ret
+        mod = ps4elf.build(segments=[(0, bytes(mcode), 0x1000, 5)], symbols=[(f, ps4elf.STT_FUNC, 0x40)],
+                           relocations=[], libraries=[(ps4elf.DT_SCE_EXPORT_LIB, 'libfoo', 1)])
+        d = tempfile.mkdtemp()
+        try:
+            for name, data in (('e.elf', exe), ('m.elf', mod)):
+                with open(os.path.join(d, name), 'wb') as fh:
+                    fh.write(data)
+            calls = os.path.join(d, 'calls')
+            env = {k: v for k, v in os.environ.items() if not k.startswith('BB_CALL_CAPTURE')}
+            p = subprocess.run([self.pbboot, os.path.join(d, 'e.elf'), '--module', os.path.join(d, 'm.elf'),
+                                '--status', os.path.join(d, 's.json'), '--timeout', '5'],
+                               capture_output=True, text=True, timeout=60,
+                               env={**env, 'BB_CALL_CAPTURE_DIR': calls, 'BB_CAPTURE_RUN': 'boot-test'})
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(os.path.join(d, 's.json')) as fh:
+                s = json.load(fh)
+            self.assertEqual((s['outcome'], s['imports_bundled'], s['imports_called']), ('returned', 1, 1))
+            self.assertFalse(os.path.exists(calls))
+        finally:
+            shutil.rmtree(d)
+
     def test_c_nid_matches_python(self):
         import ctypes
         import harness

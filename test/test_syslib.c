@@ -7,6 +7,8 @@
 #include "runtime/syslib.h"
 
 #include <errno.h>
+#include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -14,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -154,6 +157,74 @@ static __attribute__((noinline)) double sum_doubles(int count, ...)
 static f_size nested_inner;
 static __attribute__((noinline)) uint64_t nested_outer(void) { return nested_inner() + 1; }
 
+/* Non-local exits through a wrapped frame: longjmp to an unwrapped caller, longjmp from an inner
+   wrapped call into an outer one, a thread that exits inside a wrapped call, and a function that
+   returns twice. */
+static jmp_buf jump_back;
+static int64_t (*jumper_call)(int64_t);
+static __attribute__((noinline)) int64_t jumper(int64_t n) { longjmp(jump_back, (int)n); }
+static __attribute__((noinline)) int64_t jump_out_of_inner(int64_t n)
+{
+    if (!setjmp(jump_back)) jumper_call(n);   /* jumper never returns */
+    return 5;
+}
+static f_size thread_exit_call;
+static __attribute__((noinline)) uint64_t exit_thread(void) { pthread_exit(NULL); }
+static void *exits_inside_a_call(void *unused) { (void)unused; thread_exit_call(); return NULL; }
+
+static int (*setjmp_call)(jmp_buf);
+static jmp_buf twice;
+static void returns_twice(void)
+{
+    if (!setjmp_call(twice)) longjmp(twice, 1);
+}
+
+/* Recursion through a wrapped name, deeper than the old fixed shadow stack (1024). */
+static int64_t (*recurse_call)(int64_t);
+static __attribute__((noinline)) int64_t recurse(int64_t n) { return n ? recurse_call(n - 1) + 1 : 0; }
+
+/* Calls from several threads at once: each returns its own result; the records stay whole lines
+   and each record number is taken once. */
+enum { CAPTURE_THREADS = 8, CALLS_PER_THREAD = 20000 };
+static f_eight threaded_call;
+static void *call_many_times(void *arg)
+{
+    const int64_t base = (int64_t)(intptr_t)arg;
+    for (int i = 0; i < CALLS_PER_THREAD; i++)
+        if (threaded_call(base, i, 0, 0, 0, 0, 0, 0) != base + 2 * i) return (void *)1;
+    return NULL;
+}
+
+/* A wrapped call from a thread-specific destructor that runs after call capture's own. */
+static pthread_key_t late_key;
+static uint64_t late_result;
+static void late_destructor(void *unused) { (void)unused; late_result = nested_inner(); }
+static void *registers_late_destructor(void *unused)
+{
+    (void)unused;
+    CHECK(nested_inner() == UINT64_C(0x180000000));   /* opens this thread's call frames first */
+    pthread_setspecific(late_key, (void *)1);
+    return NULL;
+}
+
+/* x87 results: a long double comes back in st0, a complex long double in st0 and st1. */
+static __attribute__((noinline)) long double twice_long(long double x) { return x * 2; }
+static __attribute__((noinline)) long double _Complex long_pair(long double re, long double im) { return re + im * 1.0iL; }
+static unsigned x87_tags(void)
+{
+    unsigned char environment[28];
+    __asm__ volatile("fnstenv %0\n fldenv %0" : "=m"(environment));
+    return (unsigned)environment[8] | (unsigned)environment[9] << 8;
+}
+
+/* A tail call between two wrapped functions: tail_call jumps to tail_target (a thunk) with the
+   first thunk's return address still on the stack. */
+__attribute__((visibility("hidden"))) void *tail_target;
+uint64_t tail_call(void);
+__asm__(".text\n.globl tail_call\n.hidden tail_call\ntail_call:\n  jmp *tail_target(%rip)\n");
+
+int call_capture_exceptions(void);   /* test_call_capture_unwind.cpp */
+
 static char *capture_dir;
 
 /* The record file of one name in this test's run, read whole (NULL when there is none). */
@@ -177,6 +248,13 @@ static int lines(const char *text)
     return n;
 }
 
+static int occurrences(const char *text, const char *needle)
+{
+    int n = 0;
+    for (const char *p = text; p && (p = strstr(p, needle)); p++) n++;
+    return n;
+}
+
 static void remove_records(const char *name)
 {
     char path[512];
@@ -184,6 +262,165 @@ static void remove_records(const char *name)
     unlink(path);
     snprintf(path, sizeof path, "%s/%s", capture_dir, name);
     rmdir(path);
+}
+
+/* Runs one call capture case in a child process: it passes when the child's checks all passed. */
+static int passes_in_child(void (*body)(void))
+{
+    fflush(stdout);
+    fflush(stderr);
+    const pid_t child = fork();
+    if (child == 0) {
+        failures = 0;
+        body();
+        fflush(stdout);
+        _exit(failures != 0);
+    }
+    int status = 0;
+    return waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/* sceKernelGetDirectMemorySize's entry: a target with a known result for the cases below. */
+static f_size capture_target;
+
+/* A tail call from one wrapped function into another: both return, both are recorded. */
+static void capture_tail_calls(void)
+{
+    tail_target = rt_call_capture_wrap("tail_target", (void *)capture_target);
+    const f_size tail = (f_size)rt_call_capture_wrap("tail_call", (void *)tail_call);
+    CHECK(tail() == UINT64_C(0x180000000) && tail() == UINT64_C(0x180000000));
+    CHECK(lines(records_of("tail_call")) == 2 && lines(records_of("tail_target")) == 2);
+}
+
+/* longjmp out of a wrapped call to an unwrapped caller, more often than the old shadow stack had
+   frames: every call lands where it should, and each left call is noted when the next one enters
+   at its slot - the sampled ones as records without results. */
+static void capture_longjmp_to_unwrapped_caller(void)
+{
+    jumper_call = (int64_t (*)(int64_t))rt_call_capture_wrap("jumper", (void *)jumper);
+    int landed = 0;
+    for (volatile int i = 0; i < 1100; i++)
+        if (setjmp(jump_back) == 7 || !jumper_call(7)) landed++;
+    CHECK(landed == 1100);
+    const char *text = records_of("jumper");
+    CHECK(lines(text) == 51 && occurrences(text, "\"returns\": null}") == 51);
+    const f_eight eight = (f_eight)rt_call_capture_wrap("eight_after_jumps", (void *)eight_integers);
+    CHECK(eight(1, 2, 3, 4, 5, 6, 7, 8) == eight_integers(1, 2, 3, 4, 5, 6, 7, 8));
+}
+
+/* longjmp from an inner wrapped call to a setjmp inside an outer wrapped call, which then returns:
+   the outer call goes back to its own caller with its own result. */
+static void capture_longjmp_into_outer_call(void)
+{
+    jumper_call = (int64_t (*)(int64_t))rt_call_capture_wrap("jumper", (void *)jumper);
+    int64_t (*outer)(int64_t) = (int64_t (*)(int64_t))rt_call_capture_wrap("jump_out_of_inner",
+                                                                         (void *)jump_out_of_inner);
+    for (int i = 0; i < 3; i++) CHECK(outer(3) == 5);
+    const char *text = records_of("jump_out_of_inner");
+    CHECK(lines(text) == 3 && occurrences(text, "\"returns\": {\"rax\": \"0x5\"") == 3);
+}
+
+/* A thread that exits inside a wrapped call: the call is recorded at the thread's exit. */
+static void capture_thread_exit_inside_a_call(void)
+{
+    thread_exit_call = (f_size)rt_call_capture_wrap("exit_thread", (void *)exit_thread);
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, exits_inside_a_call, NULL) == 0 && pthread_join(thread, NULL) == 0);
+    const char *text = records_of("exit_thread");
+    CHECK(lines(text) == 1 && occurrences(text, "\"returns\": null}") == 1);
+}
+
+/* A wrapped call from a destructor that runs after the thread's call frames were freed: it gets
+   fresh frames, not the freed ones. */
+static void capture_call_from_late_destructor(void)
+{
+    nested_inner = (f_size)rt_call_capture_wrap("late_call", (void *)capture_target);
+    pthread_t thread;
+    CHECK(pthread_key_create(&late_key, late_destructor) == 0);
+    CHECK(pthread_create(&thread, NULL, registers_late_destructor, NULL) == 0 && pthread_join(thread, NULL) == 0);
+    CHECK(late_result == UINT64_C(0x180000000));
+    CHECK(lines(records_of("late_call")) == 2);
+}
+
+/* A function that returns twice cannot be wrapped: its second return stops the process with a
+   message instead of returning to a stale address. */
+static void capture_returns_twice_is_fatal(void)
+{
+    setjmp_call = (int (*)(jmp_buf))rt_call_capture_wrap("setjmp_like", (void *)_setjmp);
+    CHECK(died_in_fatal(returns_twice));
+}
+
+/* Recursion through a wrapped name 5000 deep: the first 50 calls and every 1000th recorded. */
+static void capture_recursion_past_old_limit(void)
+{
+    recurse_call = (int64_t (*)(int64_t))rt_call_capture_wrap("recurse", (void *)recurse);
+    CHECK(recurse_call(4999) == 4999);
+    const char *text = records_of("recurse");
+    CHECK(lines(text) == 54 && occurrences(text, "\"returns\": {") == 54);
+    CHECK(text && strstr(text, "\"call\": 4000, \"record\": 53") && strstr(text, "\"rax\": \"0x3e7\""));
+}
+
+/* 160000 calls from 8 threads: each gets its own result; 200 records, each number taken once. */
+static void capture_threads(void)
+{
+    threaded_call = (f_eight)rt_call_capture_wrap("threaded", (void *)eight_integers);
+    pthread_t threads[CAPTURE_THREADS];
+    for (intptr_t i = 0; i < CAPTURE_THREADS; i++)
+        CHECK(pthread_create(&threads[i], NULL, call_many_times, (void *)(i << 32)) == 0);
+    for (int i = 0; i < CAPTURE_THREADS; i++) {
+        void *wrong = (void *)1;
+        CHECK(pthread_join(threads[i], &wrong) == 0 && wrong == NULL);
+    }
+    const char *text = records_of("threaded");
+    CHECK(lines(text) == 200);
+    for (int i = 0; i < 200; i++) {
+        char expected[32];
+        snprintf(expected, sizeof expected, "\"record\": %d,", i);
+        CHECK(occurrences(text, expected) == 1);
+    }
+}
+
+/* x87 results are forwarded and recorded as st0 (and st1), and the x87 stack is left as the target
+   left it: values for the caller to pop, or empty. */
+static void capture_x87_results(void)
+{
+    long double (*twice_call)(long double) = (long double (*)(long double))rt_call_capture_wrap("twice_long",
+                                                                                                (void *)twice_long);
+    CHECK(twice_call(1.5L) == 3.0L && x87_tags() == 0xffff);
+    const char *text = records_of("twice_long");
+    CHECK(text && strstr(text, "\"st0\": \"00000000000000c00040\"") && !strstr(text, "\"st1\""));  /* 3.0L */
+    long double _Complex (*pair_call)(long double, long double) =
+        (long double _Complex (*)(long double, long double))rt_call_capture_wrap("long_pair", (void *)long_pair);
+    const long double _Complex pair = pair_call(1.0L, 2.0L);
+    CHECK(__real__ pair == 1.0L && __imag__ pair == 2.0L && x87_tags() == 0xffff);
+    text = records_of("long_pair");
+    CHECK(text && strstr(text, "\"st0\": \"0000000000000080ff3f\"") &&   /* 1.0L */
+          strstr(text, "\"st1\": \"00000000000000800040\""));             /* 2.0L */
+    const f_size integer_call = (f_size)rt_call_capture_wrap("no_x87", (void *)capture_target);
+    CHECK(integer_call() == UINT64_C(0x180000000) && x87_tags() == 0xffff);
+    text = records_of("no_x87");
+    CHECK(text && !strstr(text, "\"st0\""));
+}
+
+/* A record that cannot be written: the call is unaffected and the run goes on. */
+static void capture_unwritable_record(void)
+{
+    char blocked[600];
+    snprintf(blocked, sizeof blocked, "%s/unwritable", capture_dir);
+    CHECK(mkdir(blocked, 0700) == 0);
+    snprintf(blocked, sizeof blocked, "%s/unwritable/syslib-test.calls.jsonl", capture_dir);
+    CHECK(mkdir(blocked, 0700) == 0);   /* a directory where the record file would go */
+    const f_size unwritable = (f_size)rt_call_capture_wrap("unwritable", (void *)capture_target);
+    errno = 4321;
+    CHECK(unwritable != capture_target && unwritable() == UINT64_C(0x180000000) && errno == 4321);
+    CHECK(rmdir(blocked) == 0);
+}
+
+/* C++ exceptions through one and two wrapped frames and a tail call (test_call_capture_unwind.cpp). */
+static void capture_exceptions(void)
+{
+    CHECK(call_capture_exceptions() == 0);
+    CHECK(occurrences(records_of("thrower"), "\"returns\": null}") >= 2);
 }
 
 static void call_capture_tests(f_size direct_memory_size, f_affinity getaffinity, f_initattr attr_init_call,
@@ -266,6 +503,20 @@ static void call_capture_tests(f_size direct_memory_size, f_affinity getaffinity
     for (int i = 0; i < 1199; i++) CHECK(eight(i, 0, 0, 0, 0, 0, 0, 0) == i);
     CHECK(lines(records_of("eight")) == 51);
 
+    /* Each of these runs in a child, so a crash in one is reported as that case's failure. */
+    capture_target = direct_memory_size;
+    CHECK(passes_in_child(capture_tail_calls));
+    CHECK(passes_in_child(capture_longjmp_to_unwrapped_caller));
+    CHECK(passes_in_child(capture_longjmp_into_outer_call));
+    CHECK(passes_in_child(capture_thread_exit_inside_a_call));
+    CHECK(passes_in_child(capture_call_from_late_destructor));
+    CHECK(passes_in_child(capture_returns_twice_is_fatal));
+    CHECK(passes_in_child(capture_recursion_past_old_limit));
+    CHECK(passes_in_child(capture_threads));
+    CHECK(passes_in_child(capture_x87_results));
+    CHECK(passes_in_child(capture_unwritable_record));
+    CHECK(passes_in_child(capture_exceptions));
+
     /* BB_CALL_CAPTURE_ONLY leaves every other name unwrapped. */
     setenv("BB_CALL_CAPTURE_ONLY", "mixed,other", 1);
     CHECK(rt_call_capture_wrap("eight_again", (void *)eight_integers) == (void *)eight_integers);
@@ -275,7 +526,11 @@ static void call_capture_tests(f_size direct_memory_size, f_affinity getaffinity
     unsetenv("BB_CAPTURE_RUN");
 
     static const char *const names[] = {"libkernel.sceKernelGetDirectMemorySize", "libkernel.scePthreadAttrGetaffinity",
-                                        "eight", "mixed", "sum_doubles", "nested_inner", "nested_outer", "other"};
+                                        "eight", "mixed", "sum_doubles", "nested_inner", "nested_outer", "other",
+                                        "tail_target", "tail_call", "jumper", "eight_after_jumps",
+                                        "jump_out_of_inner", "exit_thread", "late_call", "setjmp_like", "recurse",
+                                        "threaded", "twice_long", "long_pair", "no_x87", "unwritable", "thrower",
+                                        "rethrow_outer", "tail_to_thrower"};
     for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) remove_records(names[i]);
     CHECK(rmdir(capture_dir) == 0);
 }

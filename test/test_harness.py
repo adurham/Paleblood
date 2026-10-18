@@ -655,8 +655,9 @@ class Harness(unittest.TestCase):
                   'from': '0x1', 'args': {'rdi': '0x900000000'}, 'returns': {'rax': '0x0'}}
         caps = os.path.join(self.d, 'caps')
         os.makedirs(caps)
+        left = dict(record, call=1, record=1, returns=None)      # a call that did not return
         with open(os.path.join(caps, 'test-run_1.calls.jsonl'), 'w') as f:
-            f.write(json.dumps(record) + '\n')
+            f.write(json.dumps(record) + '\n' + json.dumps(left) + '\n')
         lib = self.build(False)
         with self.assertRaisesRegex(verify.BadInput, 'no case files'):
             verify.run_cases(self.boot, caps, '0x00400000', 'replacement', lib)
