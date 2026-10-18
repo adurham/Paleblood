@@ -504,6 +504,51 @@ class Boot(unittest.TestCase):
         finally:
             shutil.rmtree(d)
 
+    def test_call_capture_names_import_calls(self):
+        # An import the runtime implements, called through its trampoline: with
+        # BB_CALL_CAPTURE_DIR set the call is recorded under "library.symbol" (runtime/call_capture.h)
+        # and returns what it returns without capture; unset, nothing is written.
+        import harness
+        import ps4elf
+        name = harness.nid('sceKernelGetDirectMemorySize')
+        code = bytearray(0x1000)
+        code[:7] = b'\xff\x15' + struct.pack('<i', 0x1000 - 6) + b'\xc3'      # call [import slot]; ret
+        exe = ps4elf.build(segments=[(0, bytes(code), 0x1000, 5), (0x1000, bytes(8), 0x1000, 6)],
+                           symbols=[(name + '#B#A', ps4elf.STT_FUNC, None)], relocations=[],
+                           jump_slots=[(0x1000, ps4elf.R_X86_64_JUMP_SLOT, 1, 0)],
+                           libraries=[(ps4elf.DT_SCE_IMPORT_LIB, 'libkernel', 1)])
+        d = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(d, 'e.elf'), 'wb') as fh:
+                fh.write(exe)
+            with open(os.path.join(d, 'nids.xml'), 'w') as fh:
+                fh.write(f'<Entry obf="{name}" sym="sceKernelGetDirectMemorySize"/>\n')
+            calls = os.path.join(d, 'calls')
+            env = {k: v for k, v in os.environ.items() if not k.startswith('BB_CALL_CAPTURE')}
+
+            def run(extra):
+                p = subprocess.run([self.pbboot, os.path.join(d, 'e.elf'), '--nids', os.path.join(d, 'nids.xml'),
+                                    '--status', os.path.join(d, 's.json'), '--timeout', '5'],
+                                   capture_output=True, text=True, timeout=60, env={**env, **extra})
+                self.assertEqual(p.returncode, 0, p.stderr)
+                with open(os.path.join(d, 's.json')) as fh:
+                    return json.load(fh)
+
+            s = run({})
+            self.assertEqual((s['outcome'], s['imports_called']), ('returned', 1))
+            self.assertFalse(os.path.exists(calls))
+            s = run({'BB_CALL_CAPTURE_DIR': calls, 'BB_CAPTURE_RUN': 'boot-test'})
+            self.assertEqual((s['outcome'], s['imports_called']), ('returned', 1))
+            path = os.path.join(calls, 'libkernel.sceKernelGetDirectMemorySize', 'boot-test.calls.jsonl')
+            with open(path) as fh:
+                records = [json.loads(line) for line in fh]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]['name'], 'libkernel.sceKernelGetDirectMemorySize')
+            self.assertEqual(records[0]['returns']['rax'], '0x180000000')
+            self.assertEqual(records[0]['from'], hex(0x800000000 + 6))           # eboot's call site
+        finally:
+            shutil.rmtree(d)
+
     def test_c_nid_matches_python(self):
         import ctypes
         import harness

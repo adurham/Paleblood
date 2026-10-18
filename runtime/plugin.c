@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "runtime/call_capture.h"
 #include "runtime/guest.h"
 #include "runtime/host.h"
 #include "runtime/hooks.h"
@@ -40,7 +41,7 @@ int bbgame_init(const rt_host *host)
     rt_image = host->image;
     if (rt_hooks_install(game_hooks, game_hook_count))
         return 1;
-    unsigned installed = 0;
+    unsigned installed = 0, recorded = 0;
     for (unsigned i = 0; i < game_hook_count; i++) {
         const rt_hook_entry *h = &game_hooks[i];
         if (skipped(h)) {
@@ -48,12 +49,17 @@ int bbgame_init(const rt_host *host)
             continue;
         }
         installed++;
-        if (h->address < RT_EBOOT_BASE ||
-            host->install_hook(h->address - RT_EBOOT_BASE, h->size, (const void *)h->fn)) {
+        /* With BB_CALL_CAPTURE_DIR set the hook goes through a recording thunk; otherwise this is
+           the replacement itself (runtime/call_capture.h). */
+        const void *target = rt_call_capture_wrap(h->name, (void *)h->fn);
+        recorded += target != (const void *)h->fn;
+        if (h->address < RT_EBOOT_BASE || host->install_hook(h->address - RT_EBOOT_BASE, h->size, target)) {
             fprintf(stderr, "bbgame: cannot hook %s at 0x%08x (%u bytes)\n", h->name, h->address, h->size);
             return 1;
         }
     }
     fprintf(stderr, "bbgame: %u hook(s) installed\n", installed);
+    if (recorded)
+        fprintf(stderr, "bbgame: calls to %u hook(s) are recorded (BB_CALL_CAPTURE_DIR)\n", recorded);
     return rt_probes_install(host->image, host->image_size);
 }

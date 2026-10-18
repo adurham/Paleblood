@@ -41,6 +41,26 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
 - Runtime: `sceKernelGetDirectMemorySize` (libkernel) is implemented. The console's direct memory region is 6 GiB - the public toolchain's `ORBIS_KERNEL_MAIN_DMEM_SIZE`, the console's 8 GiB of unified memory less the 2 GiB the kernel keeps - and the executable uses the result only as the search end of `sceKernelAllocateDirectMemory`. The boot now stops at that call instead
   (`eboot+0x2081aa3`, 116 MiB at 2 MiB alignment); the allocator that consumes it was queued as
   the memory manager in [NEXT.md](NEXT.md) and is implemented since.
+- Runtime: generic call capture (`runtime/call_capture.c`, NEXT.md runtime target 1, first part).
+  Off unless `BB_CALL_CAPTURE_DIR` is set, and then nothing changes for a name it does not wrap
+  (`BB_CALL_CAPTURE_ONLY`). When on, `bbgame_init` installs every hook through a recording thunk,
+  and `pbboot` sends every bound import's trampoline through one named `library.symbol`. The thunk
+  records the call's argument registers (rdi..r9, al, ymm0..ymm7) and return registers (rax, rdx,
+  ymm0, ymm1), sampled like the old recorders (first 50 calls per name, then every 1000th, at most
+  200), as JSON lines in `$BB_CALL_CAPTURE_DIR/<name>/<run>.calls.jsonl`. It moves the caller's
+  return address to a per-thread shadow stack so stack arguments stay where the caller put them.
+  What it does not do: discover the memory a function reads (nothing is recorded behind a
+  pointer), record stack arguments (their count is unknown without a signature), or record a call
+  that does not return (longjmp, exit). The records are not schema-1 cases and live outside the
+  case library, so `tools/verify.py` and `tools/promote.py` do not read them; for most functions
+  `tools/promote.py` still cannot move `edge-verified` to `verified` until the decisions below are
+  made. Needs an AVX host (it saves whole ymm registers); without one it warns and wraps nothing.
+- Runtime: `sceKernelGetDirectMemorySize` (libkernel) is implemented. The console's direct memory
+  region is 6 GiB - the public toolchain's `ORBIS_KERNEL_MAIN_DMEM_SIZE`, the console's 8 GiB of
+  unified memory less the 2 GiB the kernel keeps - and the executable uses the result only as the
+  search end of `sceKernelAllocateDirectMemory`. The boot now stops at that call instead
+  (`eboot+0x2081aa3`, 116 MiB at 2 MiB alignment), which needs a direct-memory pool to hand out
+  rather than one number, so it is queued as the memory manager in [NEXT.md](NEXT.md).
 - Runtime: `scePthreadAttrGetaffinity` (libkernel) is implemented. An attribute reports the CPUs a
   PS4 application may run on - six of the APU's eight cores (mask `0x3f`) - so the game's own libc
   gets past its startup query: the boot reaches the `entry` milestone and stops at
@@ -77,6 +97,26 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
 - An intermittent GPU library assertion (bad PM4 packet) while a save loads, about 75 s into a
   run, with or without recent hooks; the next run is clean.
 - Rare NVIDIA Xid 32 errors at Vulkan device creation; the run aborts before game code runs.
+
+## Decisions needed: generic capture (maintainer)
+
+The call capture above stops where the case format starts. Nothing below is implemented; schema 1,
+`docs/capture-architecture.md`, the harness's memory replay and `tools/promote.py`'s contract are
+unchanged.
+
+- **Return class.** A record holds rax, rdx, ymm0 and ymm1, but `rt_hook_entry` carries no
+  signature, so a record cannot say which of them is the result, and a case's `returns` cannot be
+  filled honestly from it. Proposal: take the return class from the function's edge cases, which
+  already state it (`returns` in `game/<system>/*_cases.py` output), keyed by hook name; a function
+  without edge cases stays unconvertible.
+- **Memory.** No memory a function reads is discovered. The old recorders rewrote pointers in
+  recorded memory by hand (`buf:`/`guest:`); generic capture would need either per-function
+  descriptors or memory replay at the original host addresses. Which one is a case-format decision.
+- **Conversion.** No tool turns call records into cases; one would need both decisions above.
+- **`docs/capture-architecture.md`** rates an assembly trampoline "not the first implementation"
+  and says production hooks remain unchanged. The thunk is opt-in and off by default, but it is an
+  assembly trampoline on production hooks; the page is left as written for the maintainer to
+  update.
 
 ## Open questions (runtime)
 

@@ -1,12 +1,17 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* The runtime's system library implementations, called the way the guest calls them: through the
    RT_SYSLIB registry, by library and symbol. */
+#define _GNU_SOURCE
+#include "runtime/call_capture.h"
 #include "runtime/process.h"
 #include "runtime/syslib.h"
 
+#include <errno.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -137,6 +142,155 @@ static int detach_state_of(void **attr) { return rt_thread_attr_detach_state(att
 static void *detach_reader_attr;
 static void read_detach_state(void) { (void)detach_state_of(&detach_reader_attr); }
 static void read_detach_state_without_variable(void) { (void)detach_state_of(NULL); }
+/* Call capture (runtime/call_capture.h): one target per argument class the thunk has to forward
+   untouched - stack arguments, vector registers, a variadic call's count in al, a nested wrapped
+   call. */
+typedef int64_t (*f_eight)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+typedef double (*f_mixed)(double, int64_t, float);
+typedef double (*f_variadic)(int, ...);
+static __attribute__((noinline)) int64_t eight_integers(int64_t a, int64_t b, int64_t c, int64_t d, int64_t e,
+                                                        int64_t f, int64_t g, int64_t h)
+{
+    return a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h;
+}
+static __attribute__((noinline)) double mixed(double x, int64_t n, float y) { return x * (double)n + y; }
+static __attribute__((noinline)) double sum_doubles(int count, ...)
+{
+    va_list list;
+    va_start(list, count);
+    double sum = 0;
+    for (int i = 0; i < count; i++) sum += va_arg(list, double);
+    va_end(list);
+    return sum;
+}
+static f_size nested_inner;
+static __attribute__((noinline)) uint64_t nested_outer(void) { return nested_inner() + 1; }
+
+static char *capture_dir;
+
+/* The record file of one name in this test's run, read whole (NULL when there is none). */
+static char *records_of(const char *name)
+{
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s/syslib-test.calls.jsonl", capture_dir, name);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    static char text[1 << 20];
+    const size_t n = fread(text, 1, sizeof text - 1, f);
+    fclose(f);
+    text[n] = 0;
+    return text;
+}
+
+static int lines(const char *text)
+{
+    int n = 0;
+    for (; text && *text; text++) n += *text == '\n';
+    return n;
+}
+
+static void remove_records(const char *name)
+{
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s/syslib-test.calls.jsonl", capture_dir, name);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/%s", capture_dir, name);
+    rmdir(path);
+}
+
+static void call_capture_tests(f_size direct_memory_size, f_affinity getaffinity, f_initattr attr_init_call,
+                               f_destroyattr attr_destroy_call)
+{
+    /* Off, the default: wrapping hands back the target itself, so every call is exactly today's. */
+    unsetenv("BB_CALL_CAPTURE_DIR");
+    unsetenv("BB_CALL_CAPTURE_ONLY");
+    CHECK(!rt_call_capture_enabled());
+    CHECK(rt_call_capture_wrap("libkernel.sceKernelGetDirectMemorySize", (void *)direct_memory_size) ==
+          (void *)direct_memory_size);
+    CHECK(rt_call_capture_wrap("eight", (void *)eight_integers) == (void *)eight_integers);
+
+    /* On: a thunk that returns what the target returns and records the call by name. */
+    const char *tmp = getenv("TMPDIR");
+    static char dir[512];
+    snprintf(dir, sizeof dir, "%s/pb-call-capture-XXXXXX", tmp && *tmp ? tmp : "/tmp");
+    capture_dir = mkdtemp(dir);
+    CHECK(capture_dir != NULL);
+    if (!capture_dir) return;
+    setenv("BB_CALL_CAPTURE_DIR", capture_dir, 1);
+    setenv("BB_CAPTURE_RUN", "syslib-test", 1);
+    CHECK(rt_call_capture_enabled());
+
+    const f_size size_call = (f_size)rt_call_capture_wrap("libkernel.sceKernelGetDirectMemorySize",
+                                                          (void *)direct_memory_size);
+    CHECK(size_call != direct_memory_size);
+    errno = 1234;
+    CHECK(size_call() == UINT64_C(0x180000000));
+    CHECK(errno == 1234);   /* writing the record does not leak into the caller's errno */
+    const char *text = records_of("libkernel.sceKernelGetDirectMemorySize");
+    CHECK(text && lines(text) == 1);
+    CHECK(text && strstr(text, "\"name\": \"libkernel.sceKernelGetDirectMemorySize\""));
+    CHECK(text && strstr(text, "\"run_id\": \"syslib-test\", \"call\": 0, \"record\": 0"));
+    CHECK(text && strstr(text, "\"returns\": {\"rax\": \"0x180000000\""));
+
+    /* A pointer argument: the target writes through it as before; the record holds its value. */
+    const f_affinity affinity_call = (f_affinity)rt_call_capture_wrap("libkernel.scePthreadAttrGetaffinity",
+                                                                      (void *)getaffinity);
+    void *attr = NULL;
+    uint64_t mask = 0;
+    char expected[64];
+    CHECK(attr_init_call(&attr) == 0);
+    CHECK(affinity_call(&attr, &mask) == 0 && mask == UINT64_C(0x3f));
+    CHECK(affinity_call(&attr, NULL) == (int)0x80020016);
+    CHECK(attr_destroy_call(&attr) == 0);
+    text = records_of("libkernel.scePthreadAttrGetaffinity");
+    snprintf(expected, sizeof expected, "\"rsi\": \"0x%llx\"", (unsigned long long)(uintptr_t)&mask);
+    CHECK(text && lines(text) == 2 && strstr(text, expected));
+    CHECK(text && strstr(text, "\"rsi\": \"0x0\"") && strstr(text, "\"rax\": \"0x80020016\""));
+
+    /* Stack arguments arrive where the caller put them. */
+    const f_eight eight = (f_eight)rt_call_capture_wrap("eight", (void *)eight_integers);
+    CHECK(eight(1, 2, 3, 4, 5, 6, 7, 8) == eight_integers(1, 2, 3, 4, 5, 6, 7, 8));
+    CHECK(eight(-1, 0, 0, 0, 0, 0, 0, 1000) == 7999);
+    text = records_of("eight");
+    CHECK(text && strstr(text, "\"r9\": \"0x6\"") && strstr(text, "\"rax\": \"0xcc\""));
+
+    /* Vector arguments and a vector return: 1.5 is 0x3ff8000000000000, recorded in memory order. */
+    const f_mixed mixed_call = (f_mixed)rt_call_capture_wrap("mixed", (void *)mixed);
+    CHECK(mixed_call(1.5, 4, 0.25f) == 6.25);
+    text = records_of("mixed");
+    CHECK(text && strstr(text, "\"ymm0\": \"000000000000f83f") && strstr(text, "\"rdi\": \"0x4\""));
+    CHECK(text && strstr(text, "\"ymm1\": \"0000803e"));                   /* 0.25f */
+    CHECK(text && strstr(text, "\"returns\": {\"rax\": ") && strstr(text, "\"ymm0\": \"0000000000001940")); /* 6.25 */
+
+    /* A variadic call keeps al, the count of vector registers it uses. */
+    const f_variadic variadic = (f_variadic)rt_call_capture_wrap("sum_doubles", (void *)sum_doubles);
+    CHECK(variadic(3, 1.0, 2.0, 4.0) == 7.0);
+    text = records_of("sum_doubles");
+    CHECK(text && strstr(text, "\"al\": \"0x3\""));
+
+    /* A wrapped call inside a wrapped call: each returns to its own caller, each is recorded. */
+    nested_inner = (f_size)rt_call_capture_wrap("nested_inner", (void *)direct_memory_size);
+    const f_size outer = (f_size)rt_call_capture_wrap("nested_outer", (void *)nested_outer);
+    CHECK(outer() == UINT64_C(0x180000001));
+    CHECK(lines(records_of("nested_inner")) == 1 && lines(records_of("nested_outer")) == 1);
+
+    /* Sampling, per name: the first 50 calls, then every 1000th. */
+    for (int i = 0; i < 1199; i++) CHECK(eight(i, 0, 0, 0, 0, 0, 0, 0) == i);
+    CHECK(lines(records_of("eight")) == 51);
+
+    /* BB_CALL_CAPTURE_ONLY leaves every other name unwrapped. */
+    setenv("BB_CALL_CAPTURE_ONLY", "mixed,other", 1);
+    CHECK(rt_call_capture_wrap("eight_again", (void *)eight_integers) == (void *)eight_integers);
+    CHECK(rt_call_capture_wrap("other", (void *)eight_integers) != (void *)eight_integers);
+    unsetenv("BB_CALL_CAPTURE_ONLY");
+    unsetenv("BB_CALL_CAPTURE_DIR");
+    unsetenv("BB_CAPTURE_RUN");
+
+    static const char *const names[] = {"libkernel.sceKernelGetDirectMemorySize", "libkernel.scePthreadAttrGetaffinity",
+                                        "eight", "mixed", "sum_doubles", "nested_inner", "nested_outer", "other"};
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) remove_records(names[i]);
+    CHECK(rmdir(capture_dir) == 0);
+}
 
 int main(void)
 {
@@ -482,6 +636,7 @@ int main(void)
     CHECK(filled[0] == 0xa5 && filled[1] == 0xa5 && filled[2] == 0xa5 && filled[3] == 0xee);
     CHECK(libc_memset(filled, 0, 0) == filled && filled[0] == 0xa5);
     CHECK(is_implemented("libSceLibcInternal", "memcpy") && is_implemented("libSceLibcInternal", "memset"));
+    call_capture_tests(direct_memory_size, getaffinity, attr_init_call, attr_destroy_call);
 
     if (!failures) puts("syslib: ok");
     return failures != 0;
