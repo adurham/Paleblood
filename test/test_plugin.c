@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "runtime/call_capture.h"
 #include "runtime/guest.h"
 #include "runtime/hooks.h"
 #include "runtime/host.h"
@@ -132,16 +133,18 @@ int main(void)
                     "probe failure must occur after hooks are installed");
 
     /* With call capture on, a wanted hook gets a recording thunk that still runs its replacement;
-       the others keep the replacement itself (runtime/call_capture.h). */
+       the others keep the replacement itself (runtime/call_capture.h). In a build without call
+       capture every hook keeps its replacement and nothing is written. */
     reset_observations();
     const char *tmp = getenv("TMPDIR");
-    char dir[512], path[600];
+    char dir[512];
     snprintf(dir, sizeof dir, "%s/pb-plugin-capture-XXXXXX", tmp && *tmp ? tmp : "/tmp");
     failed |= check(mkdtemp(dir) != NULL, "a temporary capture directory must be created");
     setenv("BB_CALL_CAPTURE_DIR", dir, 1);
     setenv("BB_CALL_CAPTURE_ONLY", "replacement_one", 1);
     setenv("BB_CAPTURE_RUN", "plugin-test", 1);
     failed |= check(bbgame_init(&host) == 0, "host must initialize with call capture on");
+#if BB_ENABLE_CALL_CAPTURE
     failed |= check(installed_count == 2 && installed[0].target != (const void *)replacement_one &&
                     installed[1].target == (const void *)replacement_two,
                     "only the wanted hook must go through a recording thunk");
@@ -149,6 +152,7 @@ int main(void)
         ((void (*)(void))installed[0].target)();
         failed |= check(replacement_one_calls == 1, "the thunk must run the replacement");
     }
+    char path[600];
     snprintf(path, sizeof path, "%s/replacement_one/plugin-test.calls.jsonl", dir);
     FILE *record = fopen(path, "r");
     char line[4096] = "";
@@ -160,7 +164,12 @@ int main(void)
     unlink(path);
     snprintf(path, sizeof path, "%s/replacement_one", dir);
     rmdir(path);
-    rmdir(dir);
+#else
+    failed |= check(installed_count == 2 && installed[0].target == (const void *)replacement_one &&
+                    installed[1].target == (const void *)replacement_two,
+                    "a build without call capture must install the replacements themselves");
+#endif
+    failed |= check(rmdir(dir) == 0, "the capture directory must hold nothing else");
     unsetenv("BB_CALL_CAPTURE_DIR");
     unsetenv("BB_CALL_CAPTURE_ONLY");
     unsetenv("BB_CAPTURE_RUN");

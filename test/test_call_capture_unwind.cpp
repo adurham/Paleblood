@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // C++ exceptions through call capture's thunk (runtime/call_capture.h), for test_syslib.c: the
 // thunk's unwind information has to lead the unwinder back to the wrapped call's caller, with the
-// caller's callee-saved registers, through one thunk, two, and a tail call between two.
+// caller's callee-saved registers, through one thunk, two, and a tail call between two; and an
+// unwinder that finds no unwind information for a frame stops the program rather than skip it.
 #include "runtime/call_capture.h"
 
 #include <stdexcept>
@@ -44,8 +45,26 @@ extern "C" {
 __attribute__((visibility("hidden"))) void *tail_thrower_target;
 int tail_into_thrower(int);
 }
-__asm__(".text\n.globl tail_into_thrower\n.hidden tail_into_thrower\ntail_into_thrower:\n"
-        "  jmp *tail_thrower_target(%rip)\n");
+__asm__(".pushsection .text\n.globl tail_into_thrower\n.hidden tail_into_thrower\ntail_into_thrower:\n"
+        "  jmp *tail_thrower_target(%rip)\n.popsection\n");
+
+// A frame with no unwind information - what a wrapped frame is to a guest unwinder, which reads
+// only the guest modules' tables: it calls its first argument with its second.
+extern "C" int call_without_unwind_info(Thrower call, int n);
+__asm__(".pushsection .text\n.globl call_without_unwind_info\n.hidden call_without_unwind_info\n"
+        "call_without_unwind_info:\n"
+        "  push %rbp\n  mov %rsp, %rbp\n  mov %rdi, %rax\n  mov %esi, %edi\n  call *%rax\n  pop %rbp\n  ret\n"
+        ".popsection\n");
+
+// An exception thrown below that frame must stop in std::terminate: the unwinder cannot step past
+// a frame it cannot describe, so the catch here is never reached (returning is the failure).
+extern "C" void throw_through_frame_without_unwind_info(void)
+{
+    try {
+        call_without_unwind_info(throw_unless_negative, 1);
+    } catch (...) {
+    }
+}
 
 extern "C" int call_capture_exceptions(void)
 {

@@ -40,6 +40,51 @@ jobs:
           BB_LOADER: build/runtime/libpbloader.so
         run: python3 -m unittest discover -s test -p 'test_differential.py'
 
+  call-capture:
+    # Generic call capture (runtime/call_capture.h): its capture-on battery (test_syslib's call
+    # capture cases and test_plugin) at -O0 under AddressSanitizer and UndefinedBehaviorSanitizer,
+    # and a build with the thunk compiled out.
+    name: call capture (${{ matrix.cc }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: gcc
+            cxx: g++
+            sanitize: -fsanitize=address,undefined
+          - cc: clang
+            cxx: clang++
+            # -fsanitize=function reads a type signature just before every indirect call's target;
+            # the generated stubs have none, so it faults on the first wrapped call.
+            sanitize: -fsanitize=address,undefined -fno-sanitize=function
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure with sanitizers (Debug, -O0)
+        run: |
+          flags="${{ matrix.sanitize }} -fno-sanitize-recover=all -fno-omit-frame-pointer"
+          cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$flags" \
+            -DCMAKE_EXE_LINKER_FLAGS="$flags"
+      - name: Build the capture tests
+        run: cmake --build build-sanitize -j --target test_syslib test_plugin
+      - name: Capture-on battery under ASan and UBSan
+        run: ctest --test-dir build-sanitize --output-on-failure --no-tests=error -R '^(syslib|plugin)$'
+      - name: Configure and build without call capture
+        run: |
+          cmake -S . -B build-off -DCMAKE_BUILD_TYPE=Release -DBB_ENABLE_CALL_CAPTURE=OFF \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          cmake --build build-off -j
+      - name: Tests without call capture
+        run: ctest --test-dir build-off --output-on-failure --no-tests=error -R '^(syslib|plugin)$'
+      - name: No thunk code without call capture
+        run: |
+          if nm build-off/runtime/pbboot build-off/test_syslib build-off/test_plugin build-off/game/libbbgame.so |
+              grep -E 'rt_call_capture_(thunk|enter|leave|returned)'; then
+            echo "call capture code in a build without it" >&2
+            exit 1
+          fi
+
   policy:
     runs-on: ubuntu-24.04
     steps:

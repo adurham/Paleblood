@@ -651,7 +651,8 @@ class Harness(unittest.TestCase):
         # The runtime's generic call capture (runtime/call_capture.h) writes registers by name,
         # not schema-1 cases: verify.py, the harness's batch mode and promote.py must not take a
         # record file for a case, even in a function's case directory.
-        record = {'name': 'synthetic_function', 'run_id': 'test-run_1', 'call': 0, 'record': 0,
+        record = {'record_format': 1, 'capture_commit': '0' * 40,
+                  'name': 'synthetic_function', 'run_id': 'test-run_1', 'call': 0, 'record': 0,
                   'from': '0x1', 'args': {'rdi': '0x900000000'}, 'returns': {'rax': '0x0'}}
         caps = os.path.join(self.d, 'caps')
         os.makedirs(caps)

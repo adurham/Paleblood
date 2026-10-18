@@ -58,9 +58,12 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
   or the x87/SSE control state. The records are not schema-1 cases and live outside the case
   library, so `tools/verify.py` and `tools/promote.py` do not read them; for most functions
   `tools/promote.py` still cannot move `edge-verified` to `verified` until the decisions below are
-  made. Needs an AVX host (it saves whole ymm registers) that allows writable and executable
-  mappings (the stubs are mapped RWX; under SELinux `deny_execmem` or similar the mapping fails);
-  without either it warns and wraps nothing.
+  made. Needs an AVX host (it saves whole ymm registers) that allows executable anonymous memory
+  (the stubs are W^X, but under SELinux `deny_execmem` or similar the mapping still fails); without
+  either it warns and wraps nothing. Signed off on the fork as an opt-in development facility
+  (below): a call that returns on another thread now stops the run naming the call, every record is
+  stamped with `record_format` and `capture_commit`, and `-DBB_ENABLE_CALL_CAPTURE=OFF` builds
+  without it.
 - Runtime: `sceKernelGetDirectMemorySize` (libkernel) is implemented. The console's direct memory
   region is 6 GiB - the public toolchain's `ORBIS_KERNEL_MAIN_DMEM_SIZE`, the console's 8 GiB of
   unified memory less the 2 GiB the kernel keeps - and the executable uses the result only as the
@@ -106,10 +109,61 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
 
 ## Decisions needed: generic capture (maintainer)
 
-The call capture above stops where the case format starts. Nothing below is implemented; schema 1,
-`docs/capture-architecture.md`, the harness's memory replay and `tools/promote.py`'s contract are
-unchanged.
+The call capture above stops where the case format starts. Schema 1, the harness's memory replay
+and `tools/promote.py`'s contract are unchanged; `docs/capture-architecture.md` now describes the
+call capture as built.
 
+- **Fork decision: accepted as an opt-in development facility (2026-10-18).** Basis: the two
+  independent verifications, `VERIFY-call-capture.md` (branch `claude/verify-call-capture-r7k2qx`,
+  of `4c4c92c`: FAIL as written, D1 to D8) and `VERIFY-call-capture-hardening.md` (branch
+  `claude/verify-capture-hardening-xb0hv6`, of `bad3066`: PASS, with N1 to N5), and the sign-off
+  change on branch `runtime/generic-input-capture-signoff`, which meets the review's conditions:
+  - N2: a wrapped call that returns on a different thread from the one it entered on stops the run
+    with a message naming the call, and its record is dropped; the entering thread's identity is in
+    every frame's serial and is checked before any bookkeeping is touched.
+  - N1: top-level asm uses `.pushsection`/`.popsection`; `test_syslib` passes under gcc `-O0` with
+    ASan and UBSan. CI's new `call capture` job runs the capture-on battery (`test_syslib`,
+    `test_plugin`) at `-O0` under ASan and UBSan with gcc and clang (clang without
+    `-fsanitize=function`, which reads a type signature before every indirect call's target and
+    so faults on any generated stub).
+  - Every record starts with `"record_format": 1` and `"capture_commit"` (the commit the capture
+    code was built from, `-dirty` or `unknown` as it applies).
+  - The stubs are W^X (code written once, then read-only and executable; data slots never
+    executable).
+  - `BB_ENABLE_CALL_CAPTURE` (CMake, on by default) compiles the thunk out entirely; CI checks that
+    such a build has no thunk symbol. `BB_CALL_CAPTURE_DIR` remains the run-time switch, and with it
+    unset the behaviour is the parent's.
+- **Upstream decision: pending (D3).** Whether the trampoline goes to Yharnam-Hunters/Paleblood is
+  the upstream maintainer's call. The commit depends on the fork's two syscall commits (`cf7a2c4`,
+  `5376799`), which have to land upstream first (`VERIFY-call-capture.md`, Q6).
+- **Fibers and context switching in the guest.** No: `symbols/imports.csv` (the executable and the
+  two bundled modules) imports nothing from a fiber library (no `libSceFiber`, no `sceFiber*`) and no
+  `getcontext`/`makecontext`/`swapcontext`. Its one context-related import is `libc.elf`'s
+  `__Ux86_64_setcontext` from libkernel, by its name libunwind's primitive for resuming at an
+  unwound frame (how an exception reaches its landing pad) on the same thread, not a switch between
+  coroutines. Context switching
+  written inside the executable itself would not show up as an import; none is known. So N2 has no
+  known trigger in this game, and if one appears the run stops rather than going wrong.
+- **Known gaps** (in the order of the harm they can do; `docs/capture-architecture.md`, "Known
+  limitations", and the header):
+  - Guest C++ exceptions cannot cross a wrapped frame: the guest unwinder finds no unwind
+    information for the first host frame and calls `std::terminate`, a loud stop, never a silent
+    skip (tested against the host unwinder; not confirmed against the target's own). No wrapped
+    path crosses guest unwinding today.
+  - A call returning on another thread stops the run (above).
+  - A wrapped function that returns twice (setjmp-like) stops the process with a message; nothing
+    wrapped today is one.
+  - The frame is matched through rbx and r12; a target that breaks the System V rule stops the
+    process or, with a stale value, could crash. A target that overwrites its own return-address
+    slot, or switches stacks and reuses one slot for a still-running call, breaks the "same slot
+    means the earlier call was left" rule.
+  - A signal handler on the same thread that makes a wrapped call while the thunk is in its enter
+    or leave helper can corrupt that thread's frames (no signal masking).
+  - The stubs need executable anonymous memory; a host that refuses it wraps nothing, with a
+    warning.
+  - Only ymm0..ymm7 are saved (no AVX-512 upper halves); left calls are noted late; frame memory is
+    kept for the life of the process; the per-call cost is about twice the first version's.
+  - Untested: the no-AVX fallback and a refused stub mapping (both warn and wrap nothing).
 - **Return class.** A record holds rax, rdx, ymm0 and ymm1, but `rt_hook_entry` carries no
   signature, so a record cannot say which of them is the result, and a case's `returns` cannot be
   filled honestly from it. Proposal: take the return class from the function's edge cases, which
@@ -119,37 +173,6 @@ unchanged.
   recorded memory by hand (`buf:`/`guest:`); generic capture would need either per-function
   descriptors or memory replay at the original host addresses. Which one is a case-format decision.
 - **Conversion.** No tool turns call records into cases; one would need both decisions above.
-- **The assembly trampoline itself (open, needs sign-off).** `docs/capture-architecture.md` rates
-  an assembly trampoline "not the first implementation" and says a production path needs "a
-  separately reviewed design and ABI tests" covering unwind behaviour, signal and exception paths,
-  per-thread nesting and recursion. The thunk is opt-in and off by default, but it is an assembly
-  trampoline on production hooks and runtime imports; the page is left as written for the
-  maintainer. Capture runs (`BB_CALL_CAPTURE_DIR` set) carry the risks below until the maintainer
-  signs the approach off or replaces it; default runs do not. The independent verification
-  (`VERIFY-call-capture.md` on `claude/verify-call-capture-r7k2qx`, of `4c4c92c`) found, ranked:
-  D1 (high) non-local exits through a wrapped frame crashed the run; D2 (medium) the fixed
-  1024-frame depth aborted deep recursion and long longjmp-heavy runs; D3 (medium) this
-  disagreement with the page; D4 (low) x87 results unrecorded and st0 live across a C call; D5 (low)
-  a freed shadow stack still reachable at thread exit; D6 (low) RWX stubs; D7 (info) untested exits,
-  depth, threads and write failures; D8 (info) the two `_ONLY` filters. D1, D2, D4, D5 and D7 are
-  fixed and tested, D6 and D8 documented; D3 is this decision. What remains, in the order of the
-  harm it can do:
-  - A guest unwinder cannot read the host's unwind information, so a guest C++ exception must not
-    cross a thunk. Hooks are host replacements and pbboot no longer wraps module exports, so no
-    wrapped path crosses guest unwinding today; a future host path that does would break it.
-  - A wrapped function that returns twice (setjmp-like) stops the process (with a message, never a
-    wrong return). Nothing wrapped today is such a function; it is excluded by provider (module
-    exports), not by name.
-  - A frame is matched to its return through rbx and r12; a target that breaks the System V rule
-    and does not preserve them stops the process or, if it leaves a stale frame pointer, could crash.
-    A target that overwrites its own return-address slot, or switches stacks and reuses one stack
-    slot for a still-running call, breaks the "same slot means the earlier call was left" rule.
-  - A signal handler on the same thread that makes a wrapped call while the thunk is inside its
-    enter or leave helper can corrupt that thread's call frames (no signal masking).
-  - Only ymm0..ymm7 are saved: a host replacement taking `__m512` arguments on an AVX-512 host
-    loses their upper halves (the guest CPU has no AVX-512, QUIRKS.md).
-  - Left calls are noted late (at the next call entering the same slot or at the thread's exit), so
-    a run that ends with such calls open does not record them.
 
 ## Open questions (runtime)
 

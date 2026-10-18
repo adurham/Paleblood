@@ -11,7 +11,7 @@ mechanism lives here and the knowledge lives in `game/` as data.
 | System libraries | `syslib/*.c`, `include/runtime/syslib.h` | implementations by library and symbol (`RT_SYSLIB`), one file per system call group |
 | NIDs | `nid.c`, `include/runtime/nid.h` | symbol name to NID |
 | Hooks and captures | `hooks.c`, `capture.c`, `include/runtime/recorder.hpp`, `probe.c`, `plugin.c` | hook registry and opt-in case writer; production hook dispatch does not connect the Recorder to replacements; serialized cases carry function/run provenance and stable buffer ordering |
-| Call capture | `call_capture.c`, `include/runtime/call_capture.h` | opt-in (`BB_CALL_CAPTURE_DIR`; `BB_CALL_CAPTURE_ONLY` filters it, separately from `BB_CAPTURE_ONLY`): a thunk per hook (`plugin.c`) and per runtime-implemented import (`boot.c`) records each call's argument and return registers by name; survives longjmp, host C++ exceptions and thread exit through it; not verification cases (no signature, no memory) |
+| Call capture | `call_capture.c`, `include/runtime/call_capture.h` | opt-in (`BB_CALL_CAPTURE_DIR`; `BB_CALL_CAPTURE_ONLY` filters it, separately from `BB_CAPTURE_ONLY`): a thunk per hook (`plugin.c`) and per runtime-implemented import (`boot.c`) records each call's argument and return registers by name; survives longjmp, host C++ exceptions and thread exit through it; a call returning on another thread stops the run; W^X stubs; records stamped with the capture code's commit; compiled out with `-DBB_ENABLE_CALL_CAPTURE=OFF`; not verification cases (no signature, no memory); docs/capture-architecture.md |
 
 ## Host v1 hook callback
 
