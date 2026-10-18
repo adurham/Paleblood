@@ -14,6 +14,30 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 add_compile_options(-Wall -Wextra -Werror)
 
+# Generic call capture (runtime/call_capture.h), an opt-in development facility: with this OFF the
+# thunk is not compiled at all; with it ON (the default) capture still stays off at run time until
+# BB_CALL_CAPTURE_DIR is set.
+option(BB_ENABLE_CALL_CAPTURE "Compile the generic call capture thunk (runtime/call_capture.h)" ON)
+if(BB_ENABLE_CALL_CAPTURE)
+    # Records name the commit the capture code was built from, checked at every build.
+    set(PB_CALL_CAPTURE_GENERATED ${CMAKE_BINARY_DIR}/generated)
+    add_custom_target(call_capture_commit ALL
+        COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
+                -DOUT=${PB_CALL_CAPTURE_GENERATED}/call_capture_commit.h
+                -P ${PROJECT_SOURCE_DIR}/runtime/call_capture_commit.cmake
+        BYPRODUCTS ${PB_CALL_CAPTURE_GENERATED}/call_capture_commit.h
+        VERBATIM)
+else()
+    add_compile_definitions(BB_ENABLE_CALL_CAPTURE=0)
+endif()
+# For each target that compiles runtime/call_capture.c.
+function(pb_call_capture target)
+    if(BB_ENABLE_CALL_CAPTURE)
+        target_include_directories(${target} PRIVATE ${PB_CALL_CAPTURE_GENERATED})
+        add_dependencies(${target} call_capture_commit)
+    endif()
+endfunction()
+
 enable_testing()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_subdirectory(runtime)
@@ -24,6 +48,7 @@ target_link_libraries(test_hooks bbrt)
 add_test(NAME hooks COMMAND test_hooks)
 add_executable(test_plugin test/test_plugin.c runtime/plugin.c runtime/hooks.c runtime/call_capture.c)
 target_include_directories(test_plugin PRIVATE runtime/include)
+pb_call_capture(test_plugin)
 add_test(NAME plugin COMMAND test_plugin)
 
 add_executable(test_host_hooks test/test_host_hooks.c runtime/host_hooks.c)
@@ -43,6 +68,7 @@ file(GLOB PB_TEST_SYSLIB CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/runtime/syslib/
 add_executable(test_syslib test/test_syslib.c test/test_call_capture_unwind.cpp runtime/process.c runtime/call_capture.c
     ${PB_TEST_SYSLIB})
 target_include_directories(test_syslib PRIVATE runtime/include)
+pb_call_capture(test_syslib)
 add_test(NAME syslib COMMAND test_syslib)
 # The direct memory pool on its own: no operating system calls, so it is tested wherever the
 # project builds, and the system calls over it are covered by the RT_SYSLIB test above.

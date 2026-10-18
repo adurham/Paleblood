@@ -507,7 +507,9 @@ class Boot(unittest.TestCase):
     def test_call_capture_names_import_calls(self):
         # An import the runtime implements, called through its trampoline: with
         # BB_CALL_CAPTURE_DIR set the call is recorded under "library.symbol" (runtime/call_capture.h)
-        # and returns what it returns without capture; unset, nothing is written.
+        # and returns what it returns without capture; unset, nothing is written. Each record is
+        # stamped with the commit the capture code was built from. A build without call capture
+        # (BB_ENABLE_CALL_CAPTURE=OFF) says so and records nothing.
         import harness
         import ps4elf
         name = harness.nid('sceKernelGetDirectMemorySize')
@@ -532,22 +534,37 @@ class Boot(unittest.TestCase):
                                    capture_output=True, text=True, timeout=60, env={**env, **extra})
                 self.assertEqual(p.returncode, 0, p.stderr)
                 with open(os.path.join(d, 's.json')) as fh:
-                    return json.load(fh)
+                    return json.load(fh), p.stderr
 
-            s = run({})
+            s, _ = run({})
             self.assertEqual((s['outcome'], s['imports_called']), ('returned', 1))
             self.assertFalse(os.path.exists(calls))
-            s = run({'BB_CALL_CAPTURE_DIR': calls, 'BB_CAPTURE_RUN': 'boot-test'})
+            s, said = run({'BB_CALL_CAPTURE_DIR': calls, 'BB_CAPTURE_RUN': 'boot-test'})
             self.assertEqual((s['outcome'], s['imports_called']), ('returned', 1))
+            if 'this build has no call capture' in said:
+                self.assertFalse(os.path.exists(calls))
+                return
             path = os.path.join(calls, 'libkernel.sceKernelGetDirectMemorySize', 'boot-test.calls.jsonl')
             with open(path) as fh:
                 records = [json.loads(line) for line in fh]
             self.assertEqual(len(records), 1)
+            self.assertEqual(list(records[0])[:2], ['record_format', 'capture_commit'])
+            self.assertEqual(records[0]['record_format'], 1)
+            self.assertEqual(records[0]['capture_commit'], self.capture_commit())
             self.assertEqual(records[0]['name'], 'libkernel.sceKernelGetDirectMemorySize')
             self.assertEqual(records[0]['returns']['rax'], '0x180000000')
             self.assertEqual(records[0]['from'], hex(0x800000000 + 6))           # eboot's call site
         finally:
             shutil.rmtree(d)
+
+    @staticmethod
+    def capture_commit():
+        """What runtime/call_capture_commit.cmake stamps a build of this checkout with."""
+        head = subprocess.run(['git', '-C', ROOT, 'rev-parse', 'HEAD'], capture_output=True, text=True)
+        if head.returncode:
+            return 'unknown'
+        dirty = subprocess.run(['git', '-C', ROOT, 'diff', '--quiet', 'HEAD', '--', 'runtime']).returncode
+        return head.stdout.strip() + ('-dirty' if dirty else '')
 
     def test_call_capture_leaves_module_exports_unwrapped(self):
         # An import bound to a bundled module's export is guest code that may return twice or

@@ -1,14 +1,17 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Generic call capture (runtime/call_capture.h).
 
-   Each wrapped target gets a stub, `movabs r11, thunk; jmp rt_call_capture_thunk`; r11 is scratch
-   in the System V convention and carries no argument. The shared thunk saves the argument
-   registers and lets rt_call_capture_enter open a frame for the call: the caller's return address,
-   rbx and r12, and the argument registers when this call is recorded. It then takes the return
-   address off the stack and calls the target with rbx pointing at the frame and r12 holding the
-   frame's serial, so the target sees its stack arguments exactly where the caller put them, and
-   the frame is found again from those two callee-saved registers however the stack was left in
-   between. When the target returns, rt_call_capture_leave writes the record and closes the frame.
+   Each wrapped target gets a stub, `mov r11, [rip+data]; jmp [rip+data+8]`, whose data slot holds
+   the thunk and rt_call_capture_thunk; r11 is scratch in the System V convention and carries no
+   argument. Stubs are W^X: a stub region's code half is written once, every stub in it the same
+   bytes, and then made read-only and executable; the slots live in its data half, readable and
+   writable and never executable. The shared thunk saves the argument registers and lets
+   rt_call_capture_enter open a frame for the call: the caller's return address, rbx and r12, and
+   the argument registers when this call is recorded. It then takes the return address off the
+   stack and calls the target with rbx pointing at the frame and r12 holding the frame's serial,
+   so the target sees its stack arguments exactly where the caller put them, and the frame is
+   found again from those two callee-saved registers however the stack was left in between. When
+   the target returns, rt_call_capture_leave writes the record and closes the frame.
 
    Non-local exits. The thunk's unwind information gives the caller's return address, rbx and r12
    from the frame, so an unwinder (a C++ exception) passes through it to the caller. A frame left
@@ -16,7 +19,17 @@
    is entered at the same stack slot (the earlier call there can no longer be running), or when the
    thread exits; its record, if it was sampled, says it did not return. A target that returns
    twice (setjmp) cannot be wrapped: its second return finds its frame closed and stops the
-   process with a message, rather than returning to the wrong place. */
+   process with a message, rather than returning to the wrong place.
+
+   Threads. A frame belongs to the thread that entered the call: the top bits of its serial are
+   that thread's capture identity, never reused in the process. A call that returns on another
+   thread (a fiber or coroutine resumed elsewhere) is caught from r12 alone, before the frame is
+   used, and stops the process naming the call; its record is dropped. Frame memory is never handed
+   back to malloc (a thread's chunks are kept for later threads), so the frame can still be read
+   for the name even when the entering thread has exited.
+
+   Built without BB_ENABLE_CALL_CAPTURE, none of this is compiled: the two entry points at the end
+   of the file say capture is off and hand back the target itself. */
 #define _GNU_SOURCE
 #include "runtime/call_capture.h"
 
@@ -34,16 +47,36 @@
 #include <time.h>
 #include <unistd.h>
 
+#if BB_ENABLE_CALL_CAPTURE
+
 #if !defined(__x86_64__)
 #error "The call capture thunk requires an x86-64 host"
 #endif
 
+/* The commit the capture code was built from (a header generated at build time by
+   runtime/call_capture_commit.cmake), stamped on every record so that records made by a thunk
+   later found to be wrong can be told apart; "unknown" when built outside the repository. */
+#if __has_include("call_capture_commit.h")
+#include "call_capture_commit.h"
+#endif
+#ifndef RT_CALL_CAPTURE_COMMIT
+#define RT_CALL_CAPTURE_COMMIT "unknown"
+#endif
+/* The record line's layout; raise it when a field changes meaning. */
+enum { RECORD_FORMAT = 1 };
+
 enum { FIRST = 50, EVERY = 1000, MAX_RECORDS = 200 };
 /* MAX_FRAMES: wrapped calls in progress (or left and not yet closed) on one thread; past it, calls
    run through the stub unrecorded. */
-enum { MAX_FRAMES = 1 << 20, FRAME_CHUNK = 256, STUB_SIZE = 32, STUB_PAGE = 1 << 16 };
+enum { MAX_FRAMES = 1 << 20, FRAME_CHUNK = 256, STUB_SIZE = 16, STUB_PAGE = 1 << 16 };
+/* A serial is the entering thread's identity above THREAD_SHIFT and the call's number on that
+   thread below it: 2^24 threads per process, 2^40 wrapped calls per thread. */
+#define THREAD_SHIFT 40
+#define MAX_THREADS (UINT64_C(1) << 24)
+#define CALL_NUMBER_MASK ((UINT64_C(1) << THREAD_SHIFT) - 1)
 
-typedef struct {
+typedef struct thunk {
+    struct thunk *next;   /* every thunk lives as long as the process (all_thunks) */
     char *name;
     char *path;   /* the run's record file for this name */
     void *target;
@@ -70,7 +103,7 @@ typedef struct {
 typedef struct frame {
     uint64_t from;            /* the caller's return address */
     uint64_t rbx, r12;        /* the caller's, while the target runs with the frame in them */
-    uint64_t serial;
+    uint64_t serial;          /* the entering thread's identity and the call's number (THREAD_SHIFT) */
     uint64_t cfa;             /* the canonical frame address the thunk reports while the target runs */
     uint64_t *slot;           /* where the caller's return address was */
     const thunk *t;
@@ -102,6 +135,7 @@ typedef struct {
     size_t capacity, slots, open;
     frame *free_frames;
     chunk *chunks;
+    uint64_t id;       /* this thread's capture identity, the top bits of its frames' serials */
     uint64_t serial;
 } thread_frames;
 
@@ -134,7 +168,7 @@ void rt_call_capture_leave(frame *f, uint64_t serial, return_registers *out) __a
     "  vmovdqu 176(%rsp), %ymm3\n  vmovdqu 208(%rsp), %ymm4\n  vmovdqu 240(%rsp), %ymm5\n"          \
     "  vmovdqu 272(%rsp), %ymm6\n  vmovdqu 304(%rsp), %ymm7\n"
 
-__asm__(".text\n"
+__asm__(".pushsection .text\n"
         ".globl rt_call_capture_thunk\n"
         ".hidden rt_call_capture_thunk\n"
         ".type rt_call_capture_thunk, @function\n"
@@ -216,13 +250,21 @@ __asm__(".text\n"
         "  .cfi_restore %rbp\n"
         "  jmp *%r11\n"
         "  .cfi_endproc\n"
-        ".size rt_call_capture_thunk, .-rt_call_capture_thunk\n");
+        ".size rt_call_capture_thunk, .-rt_call_capture_thunk\n"
+        ".popsection\n");
 
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 static pthread_key_t frames_key;
 static __thread thread_frames *frames;
+static atomic_uint_fast64_t threads_seen;
+/* Chunks of threads that have exited, for later threads: frame memory is never freed (above). */
+static pthread_mutex_t spare_lock = PTHREAD_MUTEX_INITIALIZER;
+static chunk *spare_chunks;
 static pthread_mutex_t wrap_lock = PTHREAD_MUTEX_INITIALIZER;
-static unsigned char *stubs;
+static unsigned char *stubs;   /* the current stub region's code half; its data half follows it */
+/* Every thunk made, so that each stays reachable from a global and not only from a stub's data
+   slot (memory a leak checker does not scan). */
+static thunk *all_thunks;
 static size_t stubs_used = STUB_PAGE;
 static char run_id[64];
 static atomic_int warned;
@@ -321,6 +363,32 @@ static char *record_path(const char *name)
     return path;
 }
 
+/* A stub region: STUB_PAGE bytes of code, STUB_PAGE / STUB_SIZE copies of the one stub, then
+   STUB_PAGE bytes of data, a slot per stub at the stub's own offset. The code half is written
+   while the region is only writable and then made read-only and executable, so no page is ever
+   writable and executable at once. A host that refuses executable anonymous memory (SELinux
+   deny_execmem, PaX MPROTECT) gets NULL: nothing is wrapped and a warning says so. */
+static unsigned char *new_stub_region(void)
+{
+    unsigned char *region = mmap(NULL, 2 * STUB_PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (region == MAP_FAILED)
+        return NULL;
+    /* mov r11, [rip + STUB_PAGE - 7]: the slot's thunk; jmp [rip + STUB_PAGE - 5]: the slot's
+       rt_call_capture_thunk; int3 padding. */
+    static const unsigned char stub[STUB_SIZE] = {
+        0x4c, 0x8b, 0x1d, (STUB_PAGE - 7) & 0xff, (STUB_PAGE - 7) >> 8 & 0xff, (STUB_PAGE - 7) >> 16 & 0xff, 0,
+        0xff, 0x25, (STUB_PAGE - 5) & 0xff, (STUB_PAGE - 5) >> 8 & 0xff, (STUB_PAGE - 5) >> 16 & 0xff, 0,
+        0xcc, 0xcc, 0xcc};
+    for (size_t i = 0; i < STUB_PAGE; i += STUB_SIZE)
+        memcpy(region + i, stub, STUB_SIZE);
+    __builtin___clear_cache((char *)region, (char *)region + STUB_PAGE);
+    if (mprotect(region, STUB_PAGE, PROT_READ | PROT_EXEC)) {
+        munmap(region, 2 * STUB_PAGE);
+        return NULL;
+    }
+    return region;
+}
+
 void *rt_call_capture_wrap(const char *name, void *target)
 {
     if (!target || !name || !*name || !rt_call_capture_enabled() || !wanted(name))
@@ -340,9 +408,8 @@ void *rt_call_capture_wrap(const char *name, void *target)
     t->target = target;
     pthread_mutex_lock(&wrap_lock);
     if (stubs_used + STUB_SIZE > STUB_PAGE) {
-        /* Writable and executable at once: a host that refuses such mappings gets no thunks. */
-        void *page = mmap(NULL, STUB_PAGE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (page == MAP_FAILED) {
+        unsigned char *region = new_stub_region();
+        if (!region) {
             pthread_mutex_unlock(&wrap_lock);
             warn_once("cannot map thunk memory; calls are not recorded", NULL);
             free(t->path);
@@ -350,17 +417,18 @@ void *rt_call_capture_wrap(const char *name, void *target)
             free(t);
             return target;
         }
-        stubs = page;
+        stubs = region;
         stubs_used = 0;
     }
     unsigned char *stub = stubs + stubs_used;
     stubs_used += STUB_SIZE;
-    pthread_mutex_unlock(&wrap_lock);
+    /* The slot is written before the stub is handed out; the code is never written again. */
     const uint64_t data = (uint64_t)(uintptr_t)t, code = (uint64_t)(uintptr_t)rt_call_capture_thunk;
-    unsigned char *p = stub;
-    *p++ = 0x49, *p++ = 0xbb, memcpy(p, &data, 8), p += 8;                       /* movabs r11, thunk */
-    *p++ = 0xff, *p++ = 0x25, memset(p, 0, 4), p += 4, memcpy(p, &code, 8);      /* jmp [rip]; .quad */
-    __builtin___clear_cache((char *)stub, (char *)stub + STUB_SIZE);
+    memcpy(stub + STUB_PAGE, &data, 8);
+    memcpy(stub + STUB_PAGE + 8, &code, 8);
+    t->next = all_thunks;
+    all_thunks = t;
+    pthread_mutex_unlock(&wrap_lock);
     return stub;
 }
 
@@ -393,12 +461,14 @@ static void write_record(const frame *f, const entry_registers *in, const return
     }
     name[n] = 0;
     int len = snprintf(line, sizeof line,
-                       "{\"name\": \"%s\", \"run_id\": \"%s\", \"call\": %u, \"record\": %d, \"from\": \"0x%llx\", "
+                       "{\"record_format\": %d, \"capture_commit\": \"%s\", \"name\": \"%s\", \"run_id\": \"%s\", "
+                       "\"call\": %u, \"record\": %d, \"from\": \"0x%llx\", "
                        "\"args\": {\"rdi\": \"0x%llx\", \"rsi\": \"0x%llx\", \"rdx\": \"0x%llx\", \"rcx\": \"0x%llx\", "
                        "\"r8\": \"0x%llx\", \"r9\": \"0x%llx\", \"al\": \"0x%llx\"",
-                       name, run_id, f->call, f->number, (unsigned long long)f->from, (unsigned long long)in->rdi,
-                       (unsigned long long)in->rsi, (unsigned long long)in->rdx, (unsigned long long)in->rcx,
-                       (unsigned long long)in->r8, (unsigned long long)in->r9, (unsigned long long)(in->rax & 0xff));
+                       RECORD_FORMAT, RT_CALL_CAPTURE_COMMIT, name, run_id, f->call, f->number,
+                       (unsigned long long)f->from, (unsigned long long)in->rdi, (unsigned long long)in->rsi,
+                       (unsigned long long)in->rdx, (unsigned long long)in->rcx, (unsigned long long)in->r8,
+                       (unsigned long long)in->r9, (unsigned long long)(in->rax & 0xff));
     for (int i = 0; i < 8; i++) {
         hex(vector, sizeof vector, in->ymm[i], 32);
         len += snprintf(line + len, sizeof line - len, ", \"ymm%d\": \"%s\"", i, vector);
@@ -538,9 +608,17 @@ static frame *open_frame(thread_frames *s, thunk *t, uint64_t *slot, const entry
         warn_once("too many wrapped calls in progress on one thread; further calls are not recorded", NULL);
         return NULL;
     }
+    if ((s->serial & CALL_NUMBER_MASK) == CALL_NUMBER_MASK) {
+        warn_once("2^40 wrapped calls on one thread; further calls on it are not recorded", NULL);
+        return NULL;
+    }
     if (!s->free_frames) {
-        chunk *c = malloc(sizeof *c);
-        if (!c) {
+        pthread_mutex_lock(&spare_lock);
+        chunk *c = spare_chunks;
+        if (c)
+            spare_chunks = c->next;
+        pthread_mutex_unlock(&spare_lock);
+        if (!c && !(c = malloc(sizeof *c))) {
             warn_once("no memory for a call frame; the call is not recorded", NULL);
             return NULL;
         }
@@ -592,7 +670,27 @@ static frame *open_frame(thread_frames *s, thunk *t, uint64_t *slot, const entry
     return f;
 }
 
-/* At a thread's exit: its open frames were left without returning. */
+/* The calling thread's frames, made at its first wrapped call under a new identity. */
+static thread_frames *new_thread_frames(void)
+{
+    const uint64_t id = atomic_fetch_add(&threads_seen, 1) + 1;
+    thread_frames *s = id < MAX_THREADS ? calloc(1, sizeof *s) : NULL;
+    if (!s) {
+        warn_once(id < MAX_THREADS ? "no memory for call frames; calls are not recorded"
+                                   : "too many threads for call capture; calls on new threads are not recorded",
+                  NULL);
+        return NULL;
+    }
+    s->id = id;
+    s->serial = id << THREAD_SHIFT;
+    frames = s;
+    pthread_setspecific(frames_key, s);
+    return s;
+}
+
+/* At a thread's exit: its open frames were left without returning. Its chunks are kept for later
+   threads rather than freed, so a frame stays readable for a call that returns elsewhere (above);
+   a closed frame keeps its serial and thunk until it is reused. */
 static void thread_exit(void *p)
 {
     thread_frames *s = p;
@@ -600,10 +698,17 @@ static void thread_exit(void *p)
         for (frame *f = s->table[i]; f; f = f->next) {
             report_unreturned(f);
             free(f->in);
+            f->in = NULL;
+            f->live = 0;
         }
-    for (chunk *c = s->chunks, *next; c; c = next) {
-        next = c->next;
-        free(c);
+    if (s->chunks) {
+        chunk *last = s->chunks;
+        while (last->next)
+            last = last->next;
+        pthread_mutex_lock(&spare_lock);
+        last->next = spare_chunks;
+        spare_chunks = s->chunks;
+        pthread_mutex_unlock(&spare_lock);
     }
     free(s->table);
     free(s);
@@ -614,14 +719,8 @@ entered rt_call_capture_enter(thunk *t, uint64_t *slot, const entry_registers *i
 {
     const int saved_errno = errno;
     entered e = {t->target, NULL};
-    thread_frames *s = frames;
-    if (!s && (s = calloc(1, sizeof *s))) {
-        frames = s;
-        pthread_setspecific(frames_key, s);
-    }
-    if (!s) {
-        warn_once("no memory for call frames; calls are not recorded", NULL);
-    } else {
+    thread_frames *s = frames ? frames : new_thread_frames();
+    if (s) {
         close_left(s, slot);
         e.f = open_frame(s, t, slot, in);
     }
@@ -629,11 +728,31 @@ entered rt_call_capture_enter(thunk *t, uint64_t *slot, const entry_registers *i
     return e;
 }
 
+/* A call entered on another thread (the serial's identity is not this thread's) returned here.
+   This thread's frames do not hold it and the entering thread's may be in use, so neither is
+   touched: the record is dropped and the process stops, naming the call when its frame still
+   holds it (frame memory is never freed, so reading it is safe; a reused frame has another
+   serial). */
+static void __attribute__((noreturn)) returned_on_another_thread(const frame *f, uint64_t serial,
+                                                                 const thread_frames *s)
+{
+    const char *name = f->serial == serial ? f->t->name : NULL;
+    fprintf(stderr,
+            "call capture: %s%s: a wrapped call returned on a different thread from the one it entered on "
+            "(capture thread %llu, returned on %llu): a fiber or coroutine moved between threads, which call "
+            "capture cannot follow; its record is dropped and the run stops\n",
+            name ? name : "a call whose frame was reused", name ? "" : " (name unknown)",
+            (unsigned long long)(serial >> THREAD_SHIFT), (unsigned long long)(s ? s->id : 0));
+    abort();
+}
+
 void rt_call_capture_leave(frame *f, uint64_t serial, return_registers *out)
 {
     const int saved_errno = errno;
     thread_frames *s = frames;
-    if (!s || !f->live || f->serial != serial) {
+    if (!s || serial >> THREAD_SHIFT != s->id)
+        returned_on_another_thread(f, serial, s);
+    if (!f->live || f->serial != serial) {
         fputs("call capture: a wrapped call returned after its frame was closed: the target returns twice (as "
               "setjmp does) and cannot be wrapped, or did not preserve rbx and r12\n",
               stderr);
@@ -647,3 +766,27 @@ void rt_call_capture_leave(frame *f, uint64_t serial, return_registers *out)
     close_frame(s, f, 1);
     errno = saved_errno;
 }
+
+#else /* !BB_ENABLE_CALL_CAPTURE */
+
+/* Built without call capture: nothing is ever wrapped. BB_CALL_CAPTURE_DIR set in such a build is
+   said once, rather than recording nothing in silence. */
+int rt_call_capture_enabled(void)
+{
+    static atomic_int warned;
+    const char *dir = getenv("BB_CALL_CAPTURE_DIR");
+    if (dir && *dir && !atomic_exchange(&warned, 1))
+        fputs("call capture: BB_CALL_CAPTURE_DIR is set, but this build has no call capture "
+              "(BB_ENABLE_CALL_CAPTURE=OFF); calls are not recorded\n",
+              stderr);
+    return 0;
+}
+
+void *rt_call_capture_wrap(const char *name, void *target)
+{
+    (void)name;
+    rt_call_capture_enabled();
+    return target;
+}
+
+#endif

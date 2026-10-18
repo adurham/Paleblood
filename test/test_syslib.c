@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 static int unresolved_test_entry(void) { return -1; }
@@ -145,6 +146,11 @@ static int detach_state_of(void **attr) { return rt_thread_attr_detach_state(att
 static void *detach_reader_attr;
 static void read_detach_state(void) { (void)detach_state_of(&detach_reader_attr); }
 static void read_detach_state_without_variable(void) { (void)detach_state_of(NULL); }
+#if BB_ENABLE_CALL_CAPTURE
+#if __has_include("call_capture_commit.h")
+#include "call_capture_commit.h"   /* RT_CALL_CAPTURE_COMMIT, the build's stamp */
+#endif
+
 /* Call capture (runtime/call_capture.h): one target per argument class the thunk has to forward
    untouched - stack arguments, vector registers, a variadic call's count in al, a nested wrapped
    call. */
@@ -233,9 +239,118 @@ static unsigned x87_tags(void)
    first thunk's return address still on the stack. */
 __attribute__((visibility("hidden"))) void *tail_target;
 uint64_t tail_call(void);
-__asm__(".text\n.globl tail_call\n.hidden tail_call\ntail_call:\n  jmp *tail_target(%rip)\n");
+/* pushsection/popsection: the compiler does not see a bare ".text" here, and would place what
+   follows in .text (gcc -O0 put capture_dir there, which then faulted on its first write). */
+__asm__(".pushsection .text\n.globl tail_call\n.hidden tail_call\ntail_call:\n  jmp *tail_target(%rip)\n"
+        ".popsection\n");
 
-int call_capture_exceptions(void);   /* test_call_capture_unwind.cpp */
+/* A wrapped call that returns on a different thread from the one it entered on: a coroutine that
+   yields inside the call and is resumed on another thread. */
+static ucontext_t coroutine, coroutine_caller;
+static char coroutine_stack[1 << 16];
+static int64_t (*migrating_call)(int64_t);
+static __attribute__((noinline)) int64_t yields_once(int64_t n)
+{
+    swapcontext(&coroutine, &coroutine_caller);
+    return n + 1;
+}
+static void coroutine_body(void) { migrating_call(41); }
+/* Runs the coroutine on this thread up to its yield, inside the wrapped call. */
+static void start_coroutine(void)
+{
+    migrating_call = (int64_t (*)(int64_t))rt_call_capture_wrap("migrating", (void *)yields_once);
+    getcontext(&coroutine);
+    coroutine.uc_stack.ss_sp = coroutine_stack;
+    coroutine.uc_stack.ss_size = sizeof coroutine_stack;
+    coroutine.uc_link = &coroutine_caller;
+    makecontext(&coroutine, coroutine_body, 0);
+    swapcontext(&coroutine_caller, &coroutine);
+}
+static void *start_coroutine_on_thread(void *unused) { (void)unused; start_coroutine(); return NULL; }
+static void *resume_coroutine_on_thread(void *unused)
+{
+    (void)unused;
+    swapcontext(&coroutine_caller, &coroutine);
+    return NULL;
+}
+/* Entered on this thread, returns on another while this one waits for it. */
+static void return_on_another_thread(void)
+{
+    start_coroutine();
+    pthread_t thread;
+    if (!pthread_create(&thread, NULL, resume_coroutine_on_thread, NULL)) pthread_join(thread, NULL);
+}
+/* Entered on a thread that then exits, returns on this one. */
+static void return_after_entering_thread_exited(void)
+{
+    pthread_t thread;
+    if (!pthread_create(&thread, NULL, start_coroutine_on_thread, NULL)) pthread_join(thread, NULL);
+    swapcontext(&coroutine_caller, &coroutine);
+}
+
+/* Runs `call` in a child with its stderr captured: 1 when the child stopped with SIGABRT having
+   said `needle`. */
+static int aborts_saying(void (*call)(void), const char *needle)
+{
+    int out[2];
+    if (pipe(out)) return 0;
+    fflush(stdout);
+    fflush(stderr);
+    const pid_t child = fork();
+    if (child == 0) {
+        close(out[0]);
+        dup2(out[1], 2);
+        call();
+        _exit(1);
+    }
+    close(out[1]);
+    static char said[1 << 16];
+    size_t n = 0;
+    for (ssize_t got; n < sizeof said - 1 && (got = read(out[0], said + n, sizeof said - 1 - n)) > 0;) n += (size_t)got;
+    said[n] = 0;
+    close(out[0]);
+    int status = 0;
+    const int stopped = child > 0 && waitpid(child, &status, 0) == child && WIFSIGNALED(status) &&
+                        WTERMSIG(status) == SIGABRT;
+    if (!stopped || !strstr(said, needle))
+        fprintf(stderr, "expected an abort saying \"%s\"; it said:\n%s", needle, said);
+    return stopped && strstr(said, needle);
+}
+
+/* The stamp every record starts with: the record format and the commit the capture code was built
+   from (40 hex digits, "-dirty" when runtime/ had changes), or "unknown" outside a checkout. */
+static int stamped(const char *text)
+{
+    static const char start[] = "{\"record_format\": 1, \"capture_commit\": \"";
+    if (!text || strncmp(text, start, sizeof start - 1)) return 0;
+    const char *commit = text + sizeof start - 1;
+    if (!strncmp(commit, "unknown\"", 8)) return 1;
+    size_t n = 0;
+    while ((commit[n] >= '0' && commit[n] <= '9') || (commit[n] >= 'a' && commit[n] <= 'f')) n++;
+    return n == 40 && (commit[n] == '"' || !strncmp(commit + n, "-dirty\"", 7));
+}
+
+/* The permissions of the mapping holding `address` ("r-xp"), from /proc/self/maps; whether any
+   mapping of the process is writable and executable at once. */
+static int mapping_of(const void *address, char perms[5], int *any_writable_executable)
+{
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[512], p[5];
+    unsigned long long low, high;
+    int found = 0;
+    *any_writable_executable = 0;
+    while (fgets(line, sizeof line, maps))
+        if (sscanf(line, "%llx-%llx %4s", &low, &high, p) == 3) {
+            *any_writable_executable |= p[1] == 'w' && p[2] == 'x';
+            if ((uintptr_t)address >= low && (uintptr_t)address < high) memcpy(perms, p, 5), found = 1;
+        }
+    fclose(maps);
+    return found;
+}
+
+int call_capture_exceptions(void);                         /* test_call_capture_unwind.cpp */
+void throw_through_frame_without_unwind_info(void);        /* test_call_capture_unwind.cpp */
 
 static char *capture_dir;
 
@@ -435,6 +550,44 @@ static void capture_exceptions(void)
     CHECK(occurrences(records_of("thrower"), "\"returns\": null}") >= 2);
 }
 
+/* A call that returns on a different thread stops the process naming it, before any bookkeeping is
+   touched: with the entering thread still running and after it exited. Its return is never
+   recorded (the second case's thread notes the call as left at its exit, as for any thread that
+   exits inside a call). */
+static void capture_return_on_another_thread_is_fatal(void)
+{
+    static const char said[] = "call capture: migrating: a wrapped call returned on a different thread";
+    CHECK(aborts_saying(return_on_another_thread, said));
+    CHECK(records_of("migrating") == NULL);
+    CHECK(aborts_saying(return_after_entering_thread_exited, said));
+    const char *text = records_of("migrating");
+    CHECK(lines(text) == 1 && occurrences(text, "\"returns\": null}") == 1);
+}
+
+/* A C++ exception that meets a frame its unwinder has no unwind information for - what a wrapped
+   frame is to a guest unwinder - stops in std::terminate; it is never skipped past to a catch. */
+static void capture_unwind_without_information_terminates(void)
+{
+    CHECK(aborts_saying(throw_through_frame_without_unwind_info, "terminate called after throwing"));
+}
+
+/* The stubs are W^X: the stub a call goes through is executable and not writable, and the process
+   has no mapping that is both. */
+static void capture_stubs_are_not_writable(void)
+{
+    const f_size stub = (f_size)rt_call_capture_wrap("w_xor_x", (void *)capture_target);
+    char perms[5] = "";
+    int writable_executable = 1;
+    CHECK(stub != capture_target && mapping_of((const void *)stub, perms, &writable_executable));
+    CHECK(!strcmp(perms, "r-xp") && !writable_executable);
+    CHECK(stub() == UINT64_C(0x180000000));
+    /* stubs of later wraps come from the same or a new region, all of them alike */
+    for (int i = 0; i < 5000; i++) CHECK(rt_call_capture_wrap("w_xor_x_more", (void *)capture_target) != NULL);
+    const f_size last = (f_size)rt_call_capture_wrap("w_xor_x_last", (void *)capture_target);
+    CHECK(mapping_of((const void *)last, perms, &writable_executable) && !strcmp(perms, "r-xp") &&
+          !writable_executable && last() == UINT64_C(0x180000000));
+}
+
 static void call_capture_tests(f_size direct_memory_size, f_affinity getaffinity, f_initattr attr_init_call,
                                f_destroyattr attr_destroy_call)
 {
@@ -467,6 +620,10 @@ static void call_capture_tests(f_size direct_memory_size, f_affinity getaffinity
     CHECK(text && lines(text) == 1);
     CHECK(text && strstr(text, "\"name\": \"libkernel.sceKernelGetDirectMemorySize\""));
     CHECK(text && strstr(text, "\"run_id\": \"syslib-test\", \"call\": 0, \"record\": 0"));
+    CHECK(stamped(text));   /* every record names the capture code that made it */
+#ifdef RT_CALL_CAPTURE_COMMIT
+    CHECK(text && strstr(text, "\"capture_commit\": \"" RT_CALL_CAPTURE_COMMIT "\""));
+#endif
     CHECK(text && strstr(text, "\"returns\": {\"rax\": \"0x180000000\""));
 
     /* A pointer argument: the target writes through it as before; the record holds its value. */
@@ -528,6 +685,9 @@ static void call_capture_tests(f_size direct_memory_size, f_affinity getaffinity
     CHECK(passes_in_child(capture_x87_results));
     CHECK(passes_in_child(capture_unwritable_record));
     CHECK(passes_in_child(capture_exceptions));
+    CHECK(passes_in_child(capture_return_on_another_thread_is_fatal));
+    CHECK(passes_in_child(capture_unwind_without_information_terminates));
+    CHECK(passes_in_child(capture_stubs_are_not_writable));
 
     /* BB_CALL_CAPTURE_ONLY leaves every other name unwrapped. */
     setenv("BB_CALL_CAPTURE_ONLY", "mixed,other", 1);
@@ -542,10 +702,31 @@ static void call_capture_tests(f_size direct_memory_size, f_affinity getaffinity
                                         "tail_target", "tail_call", "jumper", "eight_after_jumps",
                                         "jump_out_of_inner", "exit_thread", "late_call", "setjmp_like", "recurse",
                                         "threaded", "twice_long", "long_pair", "no_x87", "unwritable", "thrower",
-                                        "rethrow_outer", "tail_to_thrower"};
+                                        "rethrow_outer", "tail_to_thrower", "migrating", "w_xor_x", "w_xor_x_more",
+                                        "w_xor_x_last"};
     for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) remove_records(names[i]);
     CHECK(rmdir(capture_dir) == 0);
 }
+#else
+/* Built without call capture (BB_ENABLE_CALL_CAPTURE=OFF): nothing is wrapped and nothing written,
+   even with BB_CALL_CAPTURE_DIR set. */
+static void call_capture_tests(f_size direct_memory_size, f_affinity getaffinity, f_initattr attr_init_call,
+                               f_destroyattr attr_destroy_call)
+{
+    (void)getaffinity, (void)attr_init_call, (void)attr_destroy_call;
+    const char *tmp = getenv("TMPDIR");
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/pb-call-capture-off-XXXXXX", tmp && *tmp ? tmp : "/tmp");
+    CHECK(mkdtemp(dir) != NULL);
+    setenv("BB_CALL_CAPTURE_DIR", dir, 1);
+    CHECK(!rt_call_capture_enabled());
+    CHECK(rt_call_capture_wrap("libkernel.sceKernelGetDirectMemorySize", (void *)direct_memory_size) ==
+          (void *)direct_memory_size);
+    CHECK(direct_memory_size() == UINT64_C(0x180000000));
+    unsetenv("BB_CALL_CAPTURE_DIR");
+    CHECK(rmdir(dir) == 0);   /* still empty */
+}
+#endif
 
 int main(void)
 {
