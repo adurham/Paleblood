@@ -31,8 +31,16 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
 
 ## Recent results
 
+- Runtime: the direct memory group is implemented - `sceKernelAllocateDirectMemory` (116 MiB at
+  2 MiB alignment where the boot stopped), `sceKernelMapDirectMemory` and
+  `sceKernelReleaseDirectMemory`, on a direct memory pool (`runtime/syslib/dmem.c`,
+  `dmem_pool.c`, unit tested in `test/test_dmem_pool.c`). The boot report in the block above is
+  the last measured one (`sceKernelAllocateDirectMemory`) and has not been re-run since this
+  lands, so the next `tools/boot.py` run is the first evidence of where the boot stops now.
+
 - Runtime: `sceKernelGetDirectMemorySize` (libkernel) is implemented. The console's direct memory region is 6 GiB - the public toolchain's `ORBIS_KERNEL_MAIN_DMEM_SIZE`, the console's 8 GiB of unified memory less the 2 GiB the kernel keeps - and the executable uses the result only as the search end of `sceKernelAllocateDirectMemory`. The boot now stops at that call instead
-  (`eboot+0x2081aa3`, 116 MiB at 2 MiB alignment), which needs a direct-memory pool to hand out rather than one number, so it is queued as the memory manager in [NEXT.md](NEXT.md).
+  (`eboot+0x2081aa3`, 116 MiB at 2 MiB alignment); the allocator that consumes it was queued as
+  the memory manager in [NEXT.md](NEXT.md) and is implemented since.
 - Runtime: `scePthreadAttrGetaffinity` (libkernel) is implemented. An attribute reports the CPUs a
   PS4 application may run on - six of the APU's eight cores (mask `0x3f`) - so the game's own libc
   gets past its startup query: the boot reaches the `entry` milestone and stops at
