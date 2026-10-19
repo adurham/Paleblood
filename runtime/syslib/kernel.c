@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* System call group: kernel, threads and memory (libkernel, libScePosix, libSceSysmodule,
    libSceLibcInternal). */
+#include "runtime/dmem.h"
 #include "runtime/process.h"
 #include "runtime/syslib.h"
 
@@ -57,9 +58,10 @@ RT_SYSLIB_UNRESOLVED("libkernel", getpagesize, kernel_getpagesize);
    constant, stores it, or branches on it, so what the call has to supply is a bound that covers
    the region the guest allocates from. What a console answers a particular title - the whole
    region or the title's own share of it - is not public (docs/runtime-syscalls.md, section
-   "Direct memory size"). */
+   "Direct memory size"). The direct memory pool (runtime/syslib/dmem_pool.c) covers the same
+   constant, so the size a title is told and the pool it allocates from cannot disagree. */
 static uint64_t kernel_get_direct_memory_size(void)
 {
-    return UINT64_C(0x180000000); /* ORBIS_KERNEL_MAIN_DMEM_SIZE: 6 GiB of the console's 8 GiB */
+    return RT_DMEM_SIZE; /* ORBIS_KERNEL_MAIN_DMEM_SIZE: 6 GiB of the console's 8 GiB */
 }
 RT_SYSLIB("libkernel", sceKernelGetDirectMemorySize, kernel_get_direct_memory_size);

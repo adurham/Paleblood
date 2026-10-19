@@ -43,6 +43,11 @@ file(GLOB PB_TEST_SYSLIB CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/runtime/syslib/
 add_executable(test_syslib test/test_syslib.c runtime/process.c ${PB_TEST_SYSLIB})
 target_include_directories(test_syslib PRIVATE runtime/include)
 add_test(NAME syslib COMMAND test_syslib)
+# The direct memory pool on its own: no operating system calls, so it is tested wherever the
+# project builds, and the system calls over it are covered by the RT_SYSLIB test above.
+add_executable(test_dmem_pool test/test_dmem_pool.c runtime/syslib/dmem_pool.c)
+target_include_directories(test_dmem_pool PRIVATE runtime/include)
+add_test(NAME dmem_pool COMMAND test_dmem_pool)
 
 add_test(NAME tools COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${PROJECT_SOURCE_DIR}/test -p "test_*.py" -v)
 set_tests_properties(tools PROPERTIES ENVIRONMENT "BB_LOADER=$<TARGET_FILE:pbloader>;BB_PBBOOT=$<TARGET_FILE:pbboot>")
