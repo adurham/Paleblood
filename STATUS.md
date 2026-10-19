@@ -31,6 +31,25 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
 
 ## Recent results
 
+- Runtime: the direct memory manager is implemented - the pool (`runtime/syslib/dmem_pool.c`, API in
+  `runtime/include/runtime/dmem.h`) and libkernel's `sceKernelAllocateDirectMemory`,
+  `sceKernelMapDirectMemory` and `sceKernelReleaseDirectMemory` (`runtime/syslib/dmem.c`). The pool
+  covers the same `RT_DMEM_SIZE` that `sceKernelGetDirectMemorySize` reports, first-fit over a free
+  list coalesced on release, reserving the executable's image at the bottom of the region; an
+  allocation is handed out as a physical address inside that region and a mapping is a fresh
+  anonymous mapping with the protection asked for. **The boot has not been re-measured**: the dump
+  and the build host live on `amd-workstation`, and that host was offline for this session (no
+  `eboot.elf` in this checkout, and the Mac cannot build the runtime - Mach-O rejects the `rt_syslib`
+  section), so `tools/boot.py` could not run. The last recorded stop is therefore still
+  `sceKernelAllocateDirectMemory` (`symbols/boot_history.csv`, 2026-10-17); the next session with the
+  dump runs the boot report before any of this is called done. Verified instead by execution:
+  `test/test_dmem_pool.c` (300 allocations of mixed sizes and alignments, twice over the same
+  region; reuse, alignment, search window, overlaps and double releases refused) and the syscall
+  level checks in `test/test_syslib.c`; both were also run here, the pool and the three calls
+  directly, under ASan/UBSan. What remains unimplemented in this area: `sceKernelMunmap` (so a
+  release cannot be tracked against a live mapping), two mappings of one physical range are
+  independent rather than aliased, and `sceKernelGetDirectFreeMemorySize`,
+  `sceKernelAllocateMainDirectMemory` and the named mapping calls are not implemented.
 - Runtime: `sceKernelGetDirectMemorySize` (libkernel) is implemented. The console's direct memory
   region is 6 GiB - the public toolchain's `ORBIS_KERNEL_MAIN_DMEM_SIZE`, the console's 8 GiB of
   unified memory less the 2 GiB the kernel keeps - and the executable uses the result only as the
@@ -84,6 +103,20 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
   and the target result and error for a mask that names no core (`scePthreadAttrSetaffinity`, still
   unimplemented and a named diagnostic). A console measurement, or a guest call site that sets a
   strict subset, would close it.
+- The direct memory calls' own unknowns (`sceKernelAllocateDirectMemory`, `sceKernelMapDirectMemory`,
+  `sceKernelReleaseDirectMemory`; docs/runtime-syscalls.md, "Direct memory allocation, mapping and
+  release"). The runtime models the region and reserves the executable's image at its bottom, so the
+  first allocatable address is the image's end (2 MiB aligned) and address 0 is never handed out; a
+  console's physical layout at the bottom of memory is not public, and a console measurement of the
+  first allocation's address would settle it. The pool accepts any power-of-two alignment and any
+  non-zero size because whether the console works in page multiples, and what its page size is,
+  depends on `getpagesize` being established. Which error a console answers for an unallocated
+  range, an occupied fixed address or a partial release is not public, so the runtime uses the
+  FreeBSD numbers its other entries use (`EINVAL`, `EFAULT`, `ENOMEM`). Two mappings of one physical
+  range are independent mappings here instead of aliased ones (the pool has no physical pages to
+  share; a shared backing file would provide it), and a range may be released while the guest still
+  holds a mapping of it, because `sceKernelMunmap` - and any record of the mappings - is not
+  implemented.
 - `sceKernelGetDirectMemorySize` returns the console's documented direct memory region, 6 GiB (`docs/runtime-syscalls.md`, "Direct memory size"). What stays open is the number a console answers a *particular title*: public console logs give the application's share per memory mode (BigApp memory 5248 MiB on a base console, 5888 MiB on a PS4 Pro) and one shipped title expects a share of its own (`0x15f200000`) and halts on anything else. Bloodborne's four call sites only bound an allocation with the value, so the choice cannot change what the boot does; a console measurement of the call would close it.
 
 ## Pipeline health

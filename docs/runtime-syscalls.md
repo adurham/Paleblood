@@ -26,7 +26,10 @@ The decompiled frame limiter calls `gettimeofday` with a null timezone argument.
 | `sched_yield(void)` | No arguments. Returns `int`. | POSIX: the calling thread gives up the processor until it is again at the head of its thread list; `0` on success, `-1` with `errno` otherwise, and POSIX defines no error case for it. FreeBSD documents the same call. | Imported by `libc.elf` from `libkernel`. Implemented: a guest thread runs on a host thread, so the runtime yields the host thread and returns `0` (`runtime/syslib/kernel_thread.c`). A host failure has no FreeBSD error number to report, so it stops by name. Not observable in a unit test: that the host scheduler actually ran another thread. |
 | `scePthreadYield` | Asks for the same yield through the thread library. The PS4-visible signature is not established. | FreeBSD's `pthread_yield(3)` is `void`; Linux's is `int` (always `0`). No PS4-specific public source gives the SCE name's declaration. | Imported by `eboot` and `libc.elf` from `libkernel`; no call site in this repository shows whether the caller reads a result. Registered with `RT_SYSLIB_UNRESOLVED`: the entry stops by name and does not count as implemented. What would settle it: a guest call site showing whether the return register is read after the call, or a PS4-specific public declaration. Do not assume an `int` or `0` from the FreeBSD or Linux analogues. |
 | `scePthreadAttrGetaffinity(attr, mask)` | An attribute handle and a pointer to a 64-bit mask, by the public [OpenOrbis `libkernel.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/libkernel.h) declaration `int32_t scePthreadAttrGetaffinity(const OrbisPthreadAttr *, void *)`, whose second argument is commented as an `OrbisKernelCpumask`; a shipped title's `scePthreadGetaffinity(thread, &mask)` passes a `SceKernelCpumask` (`C4JThread.cpp`, the `__ORBIS__` path). | No SCE-specific public source states the result. The neighbouring attribute entries in this repository return `0` on success and an SCE code otherwise, so a null pointer is `EINVAL` here; nothing public gives another value. | Implemented: an attribute reports the CPUs it admits. A PS4 application may run on six of the APU's eight x86-64 cores, the other two being reserved for the kernel and system threads (PS4 Developer wiki, "APU"; Naughty Dog on the console's CPU); the application CPU set is therefore bits 0..5, and the shipped title above spells "all cores" as 63. A running thread and a freshly initialised attribute both default to that whole set. Open: whether the system-created main thread's default mask is exactly this whole set rather than a subset, and the target result and error for a mask that names no core (mask 0) - `scePthreadAttrSetaffinity` remains a named diagnostic that stops the boot. A console measurement, or a guest call site that sets a strict subset, would close it. |
-| `sceKernelGetDirectMemorySize(void)` | No arguments; returns a `size_t`, the console's direct memory size, by the public [OpenOrbis `libkernel.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/libkernel.h) declaration `size_t sceKernelGetDirectMemorySize()`. | OpenOrbis describes the call as getting "the amount of direct memory available for allocation" and returning it. No public source describes an error return or names an argument that could fail, so the entry has no fatal path. | Implemented: returns `0x180000000` (6 GiB), the console's direct memory region as the public toolchain documents it (`ORBIS_KERNEL_MAIN_DMEM_SIZE`: the console's 8 GiB of unified memory less the 2 GiB the kernel keeps). The executable's four call sites (`0x33ea9f`, `0x2081a80`, `0x2081ea4`, `0x26d3ebf`) each pass the result as the `searchEnd` of `sceKernelAllocateDirectMemory(0, size, ...)` and none of them compares, stores or branches on it - the use OpenOrbis's own samples make of the call. Open: the number a console answers a *particular title*, the whole region or that title's own share - public console logs and one shipped title's expectation disagree; see "Direct memory size" below. |
+| `sceKernelGetDirectMemorySize(void)` | No arguments; returns a `size_t`, the console's direct memory size, by the public [OpenOrbis `libkernel.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/libkernel.h) declaration `size_t sceKernelGetDirectMemorySize()`. | OpenOrbis describes the call as getting "the amount of direct memory available for allocation" and returning it. No public source describes an error return or names an argument that could fail, so the entry has no fatal path. | Implemented: returns `0x180000000` (6 GiB), the console's direct memory region as the public toolchain documents it (`ORBIS_KERNEL_MAIN_DMEM_SIZE`: the console's 8 GiB of unified memory less the 2 GiB the kernel keeps). The executable's four call sites (`0x33ea9f`, `0x2081a80`, `0x2081ea4`, `0x26d3ebf`) each pass the result as the `searchEnd` of `sceKernelAllocateDirectMemory(0, size, ...)` and none of them compares, stores or branches on it - the use OpenOrbis's own samples make of the call. The direct memory pool covers the same constant (`runtime/include/runtime/dmem.h`), so the size reported and the region allocated from cannot disagree. Open: the number a console answers a *particular title*, the whole region or that title's own share - public console logs and one shipped title's expectation disagree; see "Direct memory size" below. |
+| `sceKernelAllocateDirectMemory(searchStart, searchEnd, len, alignment, memoryType, physAddrOut)` | By the public [OpenOrbis `libkernel.h`](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/libkernel.h) declaration `int sceKernelAllocateDirectMemory(off_t searchStart, off_t searchEnd, size_t len, size_t alignment, int memoryType, off_t *physAddrOut)`: a window to search in, a size, an alignment, the memory type, and where to write the physical address. The physical address is an offset into the direct memory region, not a host address; `memoryType` selects the GPU's caching policy for the range (`ORBIS_KERNEL_WB_*`, `ORBIS_KERNEL_WC_*`). | OpenOrbis documents the call as allocating direct memory and returning the physical address through `physAddrOut`; success is `0`. Public sources do not enumerate the error codes, and do not say whether `len` and `alignment` have to be multiples of anything. | Implemented over the pool in `runtime/syslib/dmem_pool.c`: first fit inside the window at the requested alignment, `EINVAL` (`0x80020016`) for a size of zero, a non-power-of-two alignment, a negative or inverted window or a window outside the region, `EFAULT` (`0x8002000e`) for a null result pointer, `ENOMEM` (`0x8002000c`) when no free range of that size exists in the window. `memoryType` is accepted and has no effect: every type describes the same CPU-coherent memory and the runtime has no GPU path. Evidence for the request: the boot's own site asks for `0x7400000` (116 MiB) at `0x200000` with the region's size as the window's end, and the other sites ask for `0x20000` and for computed sizes, every one of them within the region. Open: the console's exact error for an unsatisfiable window or a bad alignment, and whether the console requires the size and alignment to be page multiples - this runtime accepts any alignment and rounds its own bookkeeping instead (see "Direct memory allocation, mapping and release"). |
+| `sceKernelMapDirectMemory(addr, len, prot, flags, physAddr, alignment)` | By the public OpenOrbis declaration `int sceKernelMapDirectMemory(void **addr, size_t len, int prot, int flags, off_t physAddr, size_t alignment)`: the address to map at (written back with the address used), the length, the protection (`ORBIS_KERNEL_PROT_CPU_*` at 0x1/0x2/0x4, the GPU bits above them), the flags (`ORBIS_KERNEL_MAP_FIXED` 0x10 and the sharing/naming bits), the physical address and its alignment. | OpenOrbis documents the call as mapping a physical range into the process and returning the address through `addr`; success is `0`. Whether an unallocated physical range, an occupied fixed address or an unaligned physical address is an error - and which code - is not public. | Implemented: the range must be one live allocation (`EINVAL` otherwise), `physAddr` must be a multiple of `alignment`, `MAP_FIXED` maps exactly at `*addr` and never replaces an existing mapping (the host's `MAP_FIXED_NOREPLACE`, reported as `EEXIST` where that applies), a null `addr`, a zero length, a non-power-of-two alignment and `MAP_FIXED` with a null address are `EINVAL`. The CPU protection bits become the host mapping's protection; the GPU bits describe GPU access to the same memory and change nothing here; flag bits other than `MAP_FIXED` are accepted and do not change the mapping, which is always private to the process. See "Direct memory allocation, mapping and release" for what the mapping is, and for the two-mappings-of-one-range question. |
+| `sceKernelReleaseDirectMemory(start, len)` | By the public OpenOrbis declaration `int sceKernelReleaseDirectMemory(off_t start, size_t len)`: the physical address and length of the allocation to return. | OpenOrbis documents the call as releasing direct memory; success is `0`. Public sources do not say what a console answers for an overlap, a partial range or a second release. | Implemented: only a range that is exactly one live allocation goes back to the pool; a range never handed out, already released, or only part of a live allocation is `EINVAL`. Released ranges are coalesced with their neighbours, so a title that allocates and releases in any order reuses the holes it made (`test/test_dmem_pool.c` makes 300 allocations of mixed sizes and alignments twice over the same region). A mapping the guest still holds keeps working after the release: `sceKernelMunmap` is not implemented, so the runtime has no record of mappings - more forgiving than a console and unable to corrupt the pool. Open: the console's answer for the refused cases. |
 
 ## Direct memory size (`sceKernelGetDirectMemorySize`)
 
@@ -69,10 +72,69 @@ returns `0x180000000`.
 before it has a direct-memory pool at all. The project records no console model of its own, and
 neither the region constant nor the log values are a measurement of the target. Because every call
 site uses the value only as the search bound of an allocation of at most 116 MiB, the choice cannot
-change what the boot does today; it will matter once the runtime hands direct memory out itself,
-when the size reported here and the pool behind it have to agree. What would settle it: a console
+change what the boot does today; it does matter now that the runtime hands direct memory out itself,
+which is why the pool behind `sceKernelAllocateDirectMemory` covers exactly this constant - the size
+reported and the region allocated from agree by construction, and what the pool reserves at the
+bottom of the region is recorded as a model in "Direct memory allocation, mapping and release".
+What would settle it: a console
 measurement of the call on the target console, a guest site that compares the value (the executable
 has none), or the target's own expected value.
+
+## Direct memory allocation, mapping and release
+
+A title's direct memory life cycle is allocate, map, release. The runtime models the region itself
+and the mappings separately, because the two are different things on a console: an allocation is a
+range of *physical* memory (the address is also what a title hands to the GPU), and a mapping is
+where the CPU sees it.
+
+**The pool** (`runtime/syslib/dmem_pool.c`, API in `runtime/include/runtime/dmem.h`) covers
+`[0, 0x180000000)` - the same `RT_DMEM_SIZE` that `sceKernelGetDirectMemorySize` reports, so the
+answer to that call and the region allocated from cannot disagree. It is a first-fit free list
+sorted by address, split at the requested alignment and coalesced on release, so released ranges are
+reused in any order and a run of a few hundred allocations leaves one block again once they are
+released (`test/test_dmem_pool.c` does that twice over the same region, with mixed sizes and
+alignments, and is the test that runs on any host because the pool makes no operating system calls).
+
+Two model decisions are the runtime's, not measurements:
+
+- **The executable's image is reserved at the bottom of the region.** Its image is the one part of
+  physical memory the runtime knows an owner for, and the boot's first request searches the region
+  from address 0, so the pool starts at the image's end (rounded up to 2 MiB) instead of handing out
+  memory the executable is standing on. A side effect is that a physical address of 0 is never
+  returned, which matters to a guest that treats one as a failure. How a console lays out the bottom
+  of physical memory is not public.
+- **The bookkeeping is single-threaded**, like the rest of the runtime: `scePthreadCreate` is not
+  implemented, so a title cannot reach the pool from two threads at once.
+
+**A mapping** is a fresh anonymous private mapping of the requested length with the protection the
+call asked for, which is why the guest gets zeroed memory and why `PROT_NONE` works. The GPU
+protection bits (`0x10` and above) describe access from the GPU to the same memory and change
+nothing about a host mapping; the flag bits other than `MAP_FIXED` describe sharing and naming this
+runtime does not model yet, and are accepted without changing the mapping. `MAP_FIXED` maps exactly
+where the caller asks and never replaces an existing mapping: the runtime will not take away memory
+the guest is still using.
+
+**What stays open** (also in STATUS.md):
+
+- *Two mappings of one physical range.* On a console they show the same bytes; here they are
+  independent mappings, because the pool has no physical pages to share. Nothing observed asks for
+  it. A shared backing file would provide it, and it is the next step if a title needs it.
+- *Granularity.* Whether the console requires `len` and `alignment` to be multiples of its page
+  size, and what that page size is, is not established (`getpagesize` is still a named diagnostic,
+  see below). The pool therefore accepts any power-of-two alignment and any non-zero size, and
+  rounds only its own bookkeeping - the guest sees exactly the alignment it asked for.
+- *Error values.* `EINVAL`, `EFAULT` and `ENOMEM` are the FreeBSD numbers the SCE names in this
+  runtime use throughout (`runtime/syslib/kernel_thread.c`); which of them a console answers for an
+  unallocated range, an occupied fixed address or an unsatisfiable window is not public.
+- *Releasing a range that is still mapped.* The runtime allows it, because `sceKernelMunmap` is not
+  implemented and no mapping is recorded; the existing mapping keeps working. A console may refuse
+  the release instead.
+
+**How it is verified.** `ctest -R '^dmem_pool$'` runs the pool's own test on any host;
+`ctest -R '^syslib$'` drives the three calls through the registry and checks the boot's 116 MiB
+request, the mapping's usability, `MAP_FIXED`, reuse after release and the refused cases. Whether
+the executable gets further is the boot report's job: `BB_ELF=... tools/boot.py` has to name the
+next unimplemented import instead of `sceKernelAllocateDirectMemory`.
 
 ## Clock IDs and platform differences
 

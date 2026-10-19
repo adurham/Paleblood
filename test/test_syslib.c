@@ -59,6 +59,9 @@ typedef int (*f_initattr)(void **);
 typedef int (*f_destroyattr)(void **);
 typedef int (*f_attrget)(void *, void **);
 typedef uint64_t (*f_size)(void);
+typedef int (*f_dmem_alloc)(int64_t, int64_t, uint64_t, uint64_t, int, uint64_t *);
+typedef int (*f_dmem_map)(void **, uint64_t, int, int, uint64_t, uint64_t);
+typedef int (*f_dmem_release)(int64_t, uint64_t);
 
 static void *net_inet_pton_entry;
 static int net_pton_unknown_family(void)
@@ -243,6 +246,71 @@ int main(void)
     CHECK(is_implemented("libkernel", "sceKernelGetDirectMemorySize"));
     CHECK(direct_memory_size() == UINT64_C(0x180000000));
     CHECK(direct_memory_size() > UINT64_C(0x7400000));
+
+    /* Direct memory: sceKernelAllocateDirectMemory hands out a physical range of the region the
+       previous call reports, sceKernelMapDirectMemory makes that range memory the guest can use,
+       and sceKernelReleaseDirectMemory gives it back to the pool. eboot's request is 116 MiB at
+       2 MiB alignment, searched from 0 to the region's end. The pool's own behaviour - reuse,
+       alignment, fragmentation over a few hundred allocations - is tested in test_dmem_pool.c. */
+    const f_dmem_alloc dm_alloc = (f_dmem_alloc)fn("libkernel", "sceKernelAllocateDirectMemory");
+    const f_dmem_map dm_map = (f_dmem_map)fn("libkernel", "sceKernelMapDirectMemory");
+    const f_dmem_release dm_release = (f_dmem_release)fn("libkernel", "sceKernelReleaseDirectMemory");
+    CHECK(is_implemented("libkernel", "sceKernelAllocateDirectMemory"));
+    CHECK(is_implemented("libkernel", "sceKernelMapDirectMemory"));
+    CHECK(is_implemented("libkernel", "sceKernelReleaseDirectMemory"));
+    if (failures) return 1;
+
+    /* The executable's image is reserved at the bottom of the region, so the first allocatable
+       address is the image's end, aligned, and never 0. */
+    rt_process.image_size = 0x5d00000;
+    const uint64_t image_end = (rt_process.image_size + 0x1fffff) & ~UINT64_C(0x1fffff);
+    uint64_t phys = 0;
+    CHECK(dm_alloc(0, (int64_t)direct_memory_size(), 0x7400000, 0x200000, 0, &phys) == 0);
+    CHECK(phys == image_end);
+    CHECK(phys % 0x200000 == 0 && phys + 0x7400000 <= direct_memory_size());
+
+    /* The mapping is usable memory with the protection asked for (CPU read and write), and it
+       starts zeroed; the last byte is inside the mapping, not past it. */
+    void *addr = NULL;
+    CHECK(dm_map(&addr, 0x7400000, 0x3, 0, phys, 0x200000) == 0 && addr);
+    if (addr) {
+        unsigned char *bytes = addr;
+        bytes[0] = 0x5a;
+        bytes[0x1000] = 0xa5;
+        bytes[0x7400000 - 1] = 0x11;
+        CHECK(bytes[0] == 0x5a && bytes[0x1000] == 0xa5 && bytes[0x7400000 - 1] == 0x11);
+        CHECK(bytes[1] == 0);
+        CHECK(munmap(addr, 0x7400000) == 0);
+
+        /* MAP_FIXED maps at the address the caller names, which is how a title places the range
+           where its own pointers expect it. */
+        void *fixed = addr;
+        CHECK(dm_map(&fixed, 0x7400000, 0x3, 0x10, phys, 0x200000) == 0);
+        CHECK(fixed == addr);
+        CHECK(munmap(fixed, 0x7400000) == 0);
+    }
+
+    /* A release returns the range, and only the range: a second release, a part of it, and a
+       mapping of it are all refused once it is back in the pool. */
+    CHECK(dm_release((int64_t)phys, 0x7400000) == 0);
+    CHECK(dm_release((int64_t)phys, 0x7400000) == (int)0x80020016);
+    CHECK(dm_release((int64_t)phys, 0x4000000) == (int)0x80020016);
+    void *released = NULL;
+    CHECK(dm_map(&released, 0x7400000, 0x3, 0, phys, 0x200000) == (int)0x80020016);
+
+    /* The next request of the same size gets the released range back. */
+    uint64_t again = 0;
+    CHECK(dm_alloc(0, (int64_t)direct_memory_size(), 0x7400000, 0x200000, 0, &again) == 0);
+    CHECK(again == phys);
+    CHECK(dm_release((int64_t)again, 0x7400000) == 0);
+
+    /* Arguments the region cannot satisfy, and a window no free range fits. */
+    uint64_t rejected = 0;
+    CHECK(dm_alloc(0, (int64_t)direct_memory_size(), 0, 0x1000, 0, &rejected) == (int)0x80020016);
+    CHECK(dm_alloc(0, (int64_t)direct_memory_size(), 0x1000, 3, 0, &rejected) == (int)0x80020016);
+    CHECK(dm_alloc(0, (int64_t)direct_memory_size(), 0x1000, 0x1000, 0, NULL) == (int)0x8002000e);
+    CHECK(dm_alloc(0, 0x1000, 0x2000, 0x1000, 0, &rejected) == (int)0x8002000c);
+    CHECK(dm_release(0, 0x1000) == (int)0x80020016);
 
     /* The PS4 host is little-endian AMD64; the network representation is big-endian. */
     CHECK(htonl(UINT32_C(0x12345678)) == UINT32_C(0x78563412));
