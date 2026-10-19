@@ -37,7 +37,8 @@ patch edit is broken in v1.09, [QUIRKS.md](QUIRKS.md)). The task manager's frame
   covers the same `RT_DMEM_SIZE` that `sceKernelGetDirectMemorySize` reports, first-fit over a free
   list coalesced on release, reserving the executable's image at the bottom of the region; an
   allocation is handed out as a physical address inside that region and a mapping is a fresh
-  anonymous mapping with the protection asked for. **The boot has not been re-measured**: the dump
+  anonymous mapping with the protection asked for. The work is on branch `fix/direct-memory`, not
+  merged: **the boot has not been re-measured** - the dump
   and the build host live on `amd-workstation`, and that host was offline for this session (no
   `eboot.elf` in this checkout, and the Mac cannot build the runtime - Mach-O rejects the `rt_syslib`
   section), so `tools/boot.py` could not run. The last recorded stop is therefore still
